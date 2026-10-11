@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/borrowguard-core",
+    "crates/borrowguard-cli",
 ]
 
 [workspace.package]
@@ -15,3 +16,9 @@ borrowguard-core   = { path = "crates/borrowguard-core" }
 
 anyhow     = "1"
 thiserror  = "2"
+clap       = { version = "4", features = ["derive", "wrap_help"] }
+csv        = "1"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono     = "0.4"
+reqwest    = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
