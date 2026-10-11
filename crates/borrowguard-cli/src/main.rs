@@ -1,13 +1,17 @@
+mod alerts;
 mod backtest;
+mod monitor;
 mod prices;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{ensure, Context, Result};
 use borrowguard_core::{leverage_from_ltv, Params};
+use borrowguard_kamino::{KaminoVenue, Pubkey};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 
+use crate::alerts::Notifier;
 use crate::backtest::{Report, SimConfig};
 
 #[derive(Parser)]
@@ -23,6 +27,11 @@ enum Cmd {
     FetchPrices(FetchArgs),
     /// Replay the controller over historical candles and compare settings.
     Backtest(BacktestArgs),
+    /// List Kamino obligations owned by a wallet.
+    Positions(PositionsArgs),
+    /// Watch a live Kamino position and report what the controller would do.
+    /// Read-only: never sends a transaction.
+    Monitor(MonitorArgs),
 }
 
 /// Controller settings shared by `backtest` and `monitor`.
@@ -59,6 +68,13 @@ impl ControllerArgs {
             min_trade: self.min_trade,
         }
     }
+}
+
+#[derive(Args)]
+struct RpcArgs {
+    /// Solana RPC endpoint. `positions` needs one that allows getProgramAccounts.
+    #[arg(long, env = "RPC_URL", default_value = "https://api.mainnet-beta.solana.com")]
+    rpc_url: String,
 }
 
 #[derive(Args)]
@@ -108,10 +124,51 @@ struct BacktestArgs {
     trades: Option<PathBuf>,
 }
 
+#[derive(Args)]
+struct PositionsArgs {
+    /// Wallet that owns the obligations.
+    #[arg(long)]
+    owner: Pubkey,
+    #[command(flatten)]
+    rpc: RpcArgs,
+}
+
+#[derive(Args)]
+struct MonitorArgs {
+    /// Kamino obligation to watch (find it with `borrowguard positions`).
+    #[arg(long)]
+    obligation: Pubkey,
+    #[command(flatten)]
+    rpc: RpcArgs,
+    #[command(flatten)]
+    controller: ControllerArgs,
+    /// No-trade band half-width around the target.
+    #[arg(long, default_value_t = 0.15)]
+    band: f64,
+    /// Seconds between checks.
+    #[arg(long, default_value_t = 10)]
+    interval: u64,
+    /// Check once and exit (non-zero on error).
+    #[arg(long)]
+    once: bool,
+    /// Fee payer for read-only simulations; defaults to the obligation owner.
+    #[arg(long)]
+    payer: Option<Pubkey>,
+    #[arg(long, env = "TELEGRAM_BOT_TOKEN", hide_env_values = true)]
+    telegram_bot_token: Option<String>,
+    #[arg(long, env = "TELEGRAM_CHAT_ID")]
+    telegram_chat_id: Option<String>,
+    #[arg(long, env = "DISCORD_WEBHOOK_URL", hide_env_values = true)]
+    discord_webhook_url: Option<String>,
+}
+
 fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     match Cli::parse().cmd {
         Cmd::FetchPrices(args) => fetch(args),
         Cmd::Backtest(args) => run_backtest(args),
+        Cmd::Positions(args) => positions(args),
+        Cmd::Monitor(args) => run_monitor(args),
     }
 }
 
@@ -214,6 +271,61 @@ fn print_row(name: &str, r: &Report, start_equity: f64) {
         r.interest,
         r.liquidated_at.map_or_else(|| "no".to_string(), date)
     );
+}
+
+fn positions(args: PositionsArgs) -> Result<()> {
+    let obligations = borrowguard_kamino::find_obligations(&args.rpc.rpc_url, &args.owner)?;
+    if obligations.is_empty() {
+        println!("no Kamino obligations owned by {}", args.owner);
+        return Ok(());
+    }
+    println!("values as of each obligation's last on-chain refresh; `monitor` shows live ones\n");
+    println!(
+        "{:<45} {:<9} {:>5} {:>5} {:>14} {:>7} {:>7}  guardable",
+        "obligation", "kind", "coll", "debt", "collateral $", "LTV", "liq LTV"
+    );
+    for (key, o) in obligations {
+        let deposited = o.deposited_value_sf.to_f64();
+        let ratio = |v: f64| {
+            if deposited > 0.0 {
+                format!("{:.1}%", v / deposited * 100.0)
+            } else {
+                "-".into()
+            }
+        };
+        let (deposits, borrows) = (o.active_deposits().count(), o.active_borrows().count());
+        println!(
+            "{:<45} {:<9} {:>5} {:>5} {:>14.2} {:>7} {:>7}  {}",
+            key.to_string(),
+            o.kind(),
+            deposits,
+            borrows,
+            deposited,
+            ratio(o.borrow_factor_adjusted_debt_value_sf.to_f64()),
+            ratio(o.unhealthy_borrow_value_sf.to_f64()),
+            if deposits == 1 && borrows == 1 { "yes" } else { "no" },
+        );
+    }
+    Ok(())
+}
+
+fn run_monitor(args: MonitorArgs) -> Result<()> {
+    let venue = KaminoVenue::new(&args.rpc.rpc_url, args.obligation, args.payer);
+    let notifier =
+        Notifier::new(args.telegram_bot_token, args.telegram_chat_id, args.discord_webhook_url);
+    let channels = notifier.channels();
+    println!(
+        "watching obligation {} every {}s, alerts: {}",
+        args.obligation,
+        args.interval,
+        if channels.is_empty() { "off".to_string() } else { channels.join(", ") }
+    );
+    monitor::run(
+        &venue,
+        |liquidation| args.controller.params(args.band, liquidation),
+        &notifier,
+        monitor::Settings { interval: Duration::from_secs(args.interval), once: args.once },
+    )
 }
 
 fn date(ms: i64) -> String {

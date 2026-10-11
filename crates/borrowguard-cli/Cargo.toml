@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 borrowguard-core   = { workspace = true }
+borrowguard-kamino = { workspace = true }
+dotenvy            = { workspace = true }
 anyhow             = { workspace = true }
 clap               = { workspace = true }
 csv                = { workspace = true }
