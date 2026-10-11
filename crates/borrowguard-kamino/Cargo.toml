@@ -1,0 +1,17 @@
+[package]
+name         = "borrowguard-kamino"
+description  = "Kamino Lend (klend) venue for BorrowGuard"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+
+[dependencies]
+borrowguard-core          = { workspace = true }
+anyhow                 = { workspace = true }
+thiserror              = { workspace = true }
+bytemuck               = { workspace = true }
+solana-program         = { workspace = true }
+solana-sdk             = { workspace = true }
+solana-client          = { workspace = true }
+solana-account-decoder = { workspace = true }
