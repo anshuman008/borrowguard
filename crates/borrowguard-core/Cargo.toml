@@ -1,0 +1,11 @@
+[package]
+name         = "borrowguard-core"
+description  = "Leverage controller math for a single-collateral, single-debt lending position"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+
+[dependencies]
+anyhow    = { workspace = true }
+thiserror = { workspace = true }

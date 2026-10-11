@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/borrowguard-core",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.84"
+license      = "MIT"
+
+[workspace.dependencies]
+borrowguard-core   = { path = "crates/borrowguard-core" }
+
+anyhow     = "1"
+thiserror  = "2"
