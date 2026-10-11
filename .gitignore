@@ -1,0 +1,12 @@
+/target
+
+# Secrets — never commit keys or RPC credentials
+.env
+.env.*
+!.env.example
+*.keypair.json
+id.json
+keypairs/
+
+# Downloaded price data (regenerate with `borrowguard fetch-prices`)
+/data
