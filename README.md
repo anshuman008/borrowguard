@@ -9,7 +9,7 @@ a no-trade band, an emergency "ripcord" and flash-loan rebalancing. It runs
 against a position you own instead of a pooled vault.
 
 > **Status: early.** The controller core, backtester and a read-only live
-> monitor (Kamino) work. The executor is not built yet, so BorrowGuard
+> monitor (Kamino, Jupiter Lend) work. The executor is not built yet, so BorrowGuard
 > never sends a transaction.
 
 ## How it works
@@ -48,6 +48,7 @@ refresh reserves + obligation → flash-borrow USDC → repay debt
 |---|---|
 | `crates/borrowguard-core` | Position math, the controller and the `Venue` trait. No Solana deps; shared by backtester and bot. |
 | `crates/borrowguard-kamino` | Kamino Lend venue: klend account layouts, refresh instructions, live snapshots. |
+| `crates/borrowguard-jupiter` | Jupiter Lend venue: Fluid vault layouts, exact tick math, live snapshots. |
 | `crates/borrowguard-cli` | The `borrowguard` binary: `fetch-prices`, `backtest`, `positions`, `monitor`. |
 
 ## Venues
@@ -55,7 +56,7 @@ refresh reserves + obligation → flash-borrow USDC → repay debt
 | Venue | Status |
 |---|---|
 | Kamino Lend | ✅ monitor |
-| Jupiter Lend | next |
+| Jupiter Lend | ✅ monitor |
 | Project 0 / marginfi, Save | planned |
 
 Each venue implements `borrowguard_core::Venue`, returning a `Snapshot`:
@@ -81,34 +82,53 @@ cargo build --release
 Run `borrowguard backtest --help` for every knob: target, ripcord, liquidation
 LTV, cost, borrow APR, trade caps and liquidation bonus.
 
-### Watch a live Kamino position
+### Watch a live position
 
 ```bash
 cp .env.example .env   # optional: RPC_URL and alert credentials
 
-# Find your obligation
+# Find your Kamino obligations and Jupiter Lend positions
 ./target/release/borrowguard positions --owner <YOUR_WALLET>
 
-# Check once, or keep watching every 10s
-./target/release/borrowguard monitor --obligation <OBLIGATION> --target 3 --once
-./target/release/borrowguard monitor --obligation <OBLIGATION> --target 3
+# Check once, or keep watching every 10s. The venue is detected from the account.
+./target/release/borrowguard monitor --position <POSITION> --payer <YOUR_WALLET> --target 3 --once
+./target/release/borrowguard monitor --position <POSITION> --payer <YOUR_WALLET> --target 3
 ```
 
-Real output for a mainnet JitoSOL/SOL multiply position (2026-10-12):
+Real output for a mainnet JitoSOL/SOL multiply position on Kamino (2026-10-12):
 
 ```
-$ borrowguard monitor --obligation 2w9MS6MBFr68VpF6dkGwb2ucdKTpNFeXwmS79HSDTxAG --target 12 --band 0.4 --ripcord 15 --once
+$ borrowguard monitor --position 2w9MS6MBFr68VpF6dkGwb2ucdKTpNFeXwmS79HSDTxAG --target 12 --band 0.4 --ripcord 15 --once
 kamino  JITOSOL/SOL  liquidation at 20.00× (LTV 95.0%), borrow limit 12.50× (LTV 92.0%)
 controller  target 12× band ±0.4 ripcord 15× (dry run: nothing is traded)
 18:50:29  JITOSOL/SOL 1.3057  lev 12.974×  LTV 92.3%  ripcord@ 1.2912 (-1.1%)  liq@ 1.2685 (-2.9%)  → DELEVER sell 12117.09 SOL of JITOSOL, repay debt
 ```
 
-How the monitor gets its numbers: it simulates `refresh_reserve` ×2 +
-`refresh_obligation` and decodes the resulting accounts. klend itself does the
-oracle reads, interest accrual and elevation-group / borrow-factor math, so the
-monitor sees exactly what klend would liquidate on. The simulation costs
-nothing and needs no signature. The fee payer defaults to the obligation owner
-and only needs to exist.
+And for a SOL/USDC position on Jupiter Lend (2026-10-13), default 3× settings:
+
+```
+jupiter  SOL/USDC  liquidation at 6.67× (LTV 85.0%), borrow limit 5.00× (LTV 80.0%)
+controller  target 3× band ±0.15 ripcord 3.6× (dry run: nothing is traded)
+19:39:44  SOL/USDC 108.1160  lev 3.888×  LTV 74.3%  ripcord@ 111.1921 (+2.8%)  liq@ 94.4769 (-12.6%)  → RIPCORD sell 5393.20 USDC of SOL, repay debt
+```
+
+How the monitor gets its numbers: it asks each protocol to do its own math by
+simulating its instructions, which costs nothing and needs no signature.
+
+- **Kamino:** simulates `refresh_reserve` ×2 + `refresh_obligation` and decodes
+  the resulting accounts. klend does the oracle reads, interest accrual and
+  elevation-group / borrow-factor math.
+- **Jupiter Lend:** debt is derived from the position's tick with a bit-exact
+  port of Fluid's tick math, converted to tokens with the vault's own
+  `get_exchange_prices` view, and priced with the oracle's
+  `get_exchange_rate_liquidate` view (the price the vault liquidates on). A
+  position whose tick was already liquidated is reported as unsupported rather
+  than shown with wrong numbers.
+
+`--payer` is the fee payer for those simulations: any wallet with a little SOL,
+normally your own. Kamino defaults it to the obligation owner. Jupiter finds
+the position's NFT holder, a lookup the public RPC throttles, so pass
+`--payer` there or use a dedicated RPC.
 
 Alerts go to Telegram and/or Discord whenever the verdict changes (for example
 hold → delever, or an RPC error).
@@ -158,7 +178,7 @@ for details.
 
 1. ✅ Controller core and backtester
 2. ✅ Read-only monitor for Kamino: live leverage, trigger prices, alerts
-3. ⬜ Jupiter Lend venue
+3. ✅ Jupiter Lend venue (monitor)
 4. ⬜ Executor: flash-loan delever/relever transactions, tested on a
    [Surfpool](https://github.com/txtx/surfpool) mainnet fork
 5. ⬜ Mainnet with a small position; dry-run by default
