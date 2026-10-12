@@ -6,10 +6,13 @@ mod prices;
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{ensure, Context, Result};
+use borrowguard_core::Venue;
 use borrowguard_core::{leverage_from_ltv, Params};
+use borrowguard_jupiter::JupiterVenue;
 use borrowguard_kamino::{KaminoVenue, Pubkey};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
+use solana_client::rpc_client::RpcClient;
 
 use crate::alerts::Notifier;
 use crate::backtest::{Report, SimConfig};
@@ -27,9 +30,10 @@ enum Cmd {
     FetchPrices(FetchArgs),
     /// Replay the controller over historical candles and compare settings.
     Backtest(BacktestArgs),
-    /// List Kamino obligations owned by a wallet.
+    /// List a wallet's Kamino and Jupiter Lend positions.
     Positions(PositionsArgs),
-    /// Watch a live Kamino position and report what the controller would do.
+    /// Watch a live Kamino or Jupiter Lend position and report what the
+    /// controller would do.
     /// Read-only: never sends a transaction.
     Monitor(MonitorArgs),
 }
@@ -126,7 +130,7 @@ struct BacktestArgs {
 
 #[derive(Args)]
 struct PositionsArgs {
-    /// Wallet that owns the obligations.
+    /// Wallet that owns the positions.
     #[arg(long)]
     owner: Pubkey,
     #[command(flatten)]
@@ -135,9 +139,10 @@ struct PositionsArgs {
 
 #[derive(Args)]
 struct MonitorArgs {
-    /// Kamino obligation to watch (find it with `borrowguard positions`).
-    #[arg(long)]
-    obligation: Pubkey,
+    /// Kamino obligation or Jupiter Lend position to watch (find it with
+    /// `borrowguard positions`). The venue is detected from the account.
+    #[arg(long, alias = "obligation")]
+    position: Pubkey,
     #[command(flatten)]
     rpc: RpcArgs,
     #[command(flatten)]
@@ -151,7 +156,7 @@ struct MonitorArgs {
     /// Check once and exit (non-zero on error).
     #[arg(long)]
     once: bool,
-    /// Fee payer for read-only simulations; defaults to the obligation owner.
+    /// Fee payer for read-only simulations; defaults to the position owner.
     #[arg(long)]
     payer: Option<Pubkey>,
     #[arg(long, env = "TELEGRAM_BOT_TOKEN", hide_env_values = true)]
@@ -274,15 +279,27 @@ fn print_row(name: &str, r: &Report, start_equity: f64) {
 }
 
 fn positions(args: PositionsArgs) -> Result<()> {
-    let obligations = borrowguard_kamino::find_obligations(&args.rpc.rpc_url, &args.owner)?;
-    if obligations.is_empty() {
-        println!("no Kamino obligations owned by {}", args.owner);
-        return Ok(());
+    let rpc_url = &args.rpc.rpc_url;
+    match borrowguard_kamino::find_obligations(rpc_url, &args.owner) {
+        Ok(obligations) => print_kamino(&obligations),
+        Err(err) => println!("kamino: lookup failed: {err:#}\n"),
     }
-    println!("values as of each obligation's last on-chain refresh; `monitor` shows live ones\n");
+    match borrowguard_jupiter::find_positions(rpc_url, &args.owner) {
+        Ok(positions) => print_jupiter(&positions),
+        Err(err) => println!("jupiter: lookup failed: {err:#}"),
+    }
+    Ok(())
+}
+
+fn print_kamino(obligations: &[(Pubkey, borrowguard_kamino::layout::Obligation)]) {
+    if obligations.is_empty() {
+        println!("kamino: no obligations\n");
+        return;
+    }
+    println!("kamino (values as of each obligation's last refresh; `monitor` shows live ones)");
     println!(
-        "{:<45} {:<9} {:>5} {:>5} {:>14} {:>7} {:>7}  guardable",
-        "obligation", "kind", "coll", "debt", "collateral $", "LTV", "liq LTV"
+        "  {:<45} {:<9} {:>5} {:>5} {:>14} {:>7} {:>7}  guardable",
+        "position", "kind", "coll", "debt", "collateral $", "LTV", "liq LTV"
     );
     for (key, o) in obligations {
         let deposited = o.deposited_value_sf.to_f64();
@@ -295,7 +312,7 @@ fn positions(args: PositionsArgs) -> Result<()> {
         };
         let (deposits, borrows) = (o.active_deposits().count(), o.active_borrows().count());
         println!(
-            "{:<45} {:<9} {:>5} {:>5} {:>14.2} {:>7} {:>7}  {}",
+            "  {:<45} {:<9} {:>5} {:>5} {:>14.2} {:>7} {:>7}  {}",
             key.to_string(),
             o.kind(),
             deposits,
@@ -306,22 +323,61 @@ fn positions(args: PositionsArgs) -> Result<()> {
             if deposits == 1 && borrows == 1 { "yes" } else { "no" },
         );
     }
-    Ok(())
+    println!();
+}
+
+fn print_jupiter(positions: &[borrowguard_jupiter::FoundPosition]) {
+    if positions.is_empty() {
+        println!("jupiter: no positions");
+        return;
+    }
+    println!("jupiter (`monitor` shows live amounts)");
+    println!(
+        "  {:<45} {:>6} {:>8} {:<14} {:>8}  guardable",
+        "position", "vault", "nft", "pair", "liq LTV"
+    );
+    for p in positions {
+        println!(
+            "  {:<45} {:>6} {:>8} {:<14} {:>7.1}%  {}",
+            p.key.to_string(),
+            p.position.vault_id,
+            p.position.nft_id,
+            p.pair,
+            p.liquidation_ltv * 100.0,
+            if p.position.supply_only { "no (no debt)" } else { "yes" },
+        );
+    }
+    println!("\n  watch one with: borrowguard monitor --position <POSITION> --payer <YOUR_WALLET>");
+}
+
+fn open_venue(rpc_url: &str, position: Pubkey, payer: Option<Pubkey>) -> Result<Box<dyn Venue>> {
+    let rpc = RpcClient::new(rpc_url.to_string());
+    let account = rpc
+        .get_account(&position)
+        .with_context(|| format!("fetch {position} (closed, or not a mainnet address?)"))?;
+    if account.owner == borrowguard_kamino::PROGRAM_ID {
+        Ok(Box::new(KaminoVenue::new(rpc_url, position, payer)))
+    } else if account.owner == borrowguard_jupiter::VAULTS_PROGRAM_ID {
+        Ok(Box::new(JupiterVenue::new(rpc_url, position, payer)))
+    } else {
+        anyhow::bail!("{position} is owned by {}, not Kamino Lend or Jupiter Lend", account.owner)
+    }
 }
 
 fn run_monitor(args: MonitorArgs) -> Result<()> {
-    let venue = KaminoVenue::new(&args.rpc.rpc_url, args.obligation, args.payer);
+    let venue = open_venue(&args.rpc.rpc_url, args.position, args.payer)?;
     let notifier =
         Notifier::new(args.telegram_bot_token, args.telegram_chat_id, args.discord_webhook_url);
     let channels = notifier.channels();
     println!(
-        "watching obligation {} every {}s, alerts: {}",
-        args.obligation,
+        "watching {} position {} every {}s, alerts: {}",
+        venue.name(),
+        args.position,
         args.interval,
         if channels.is_empty() { "off".to_string() } else { channels.join(", ") }
     );
     monitor::run(
-        &venue,
+        venue.as_ref(),
         |liquidation| args.controller.params(args.band, liquidation),
         &notifier,
         monitor::Settings { interval: Duration::from_secs(args.interval), once: args.once },
