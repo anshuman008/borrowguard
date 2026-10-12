@@ -507,6 +507,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "borrowguard-jupiter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "borrowguard-core",
+ "solana-account-decoder",
+ "solana-client",
+ "solana-program",
+ "solana-sdk",
+]
+
+[[package]]
 name = "borrowguard-kamino"
 version = "0.1.0"
 dependencies = [

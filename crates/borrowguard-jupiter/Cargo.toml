@@ -1,0 +1,16 @@
+[package]
+name         = "borrowguard-jupiter"
+description  = "Jupiter Lend (Fluid vaults) venue for BorrowGuard"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+
+[dependencies]
+borrowguard-core       = { workspace = true }
+anyhow                 = { workspace = true }
+base64                 = { workspace = true }
+solana-program         = { workspace = true }
+solana-sdk             = { workspace = true }
+solana-client          = { workspace = true }
+solana-account-decoder = { workspace = true }
