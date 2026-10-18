@@ -8,9 +8,10 @@ follows constant-leverage funds: a target,
 a no-trade band, an emergency "ripcord" and flash-loan rebalancing. It runs
 against a position you own instead of a pooled vault.
 
-> **Status: early.** The controller core, backtester and a read-only live
-> monitor (Kamino, Jupiter Lend) work. The executor is not built yet, so BorrowGuard
-> never sends a transaction.
+> **Status: early.** The controller core, backtester and live monitor (Kamino,
+> Jupiter Lend) work. Kamino **delever** works and is tested on a mainnet fork;
+> it runs only when you call it with `--send`. Automatic rebalancing from
+> `watch`, and relevering, are not built yet.
 
 ## How it works
 
@@ -47,15 +48,16 @@ refresh reserves + obligation → flash-borrow USDC → repay debt
 | Crate | What |
 |---|---|
 | `crates/borrowguard-core` | Position math, the controller and the `Venue` trait. No Solana deps; shared by backtester and bot. |
-| `crates/borrowguard-kamino` | Kamino Lend venue: klend account layouts, refresh instructions, live snapshots. |
+| `crates/borrowguard-kamino` | Kamino Lend venue: klend account layouts, instruction builders, live snapshots, delever execution. |
 | `crates/borrowguard-jupiter` | Jupiter Lend venue: Fluid vault layouts, exact tick math, live snapshots. |
-| `crates/borrowguard-cli` | The `borrowguard` binary: `fetch-prices`, `backtest`, `positions`, `monitor`. |
+| `crates/borrowguard-exec` | Execution plumbing shared by venues: Jupiter swaps, lookup tables, compose / simulate / send. |
+| `crates/borrowguard-cli` | The `borrowguard` binary: `fetch-prices`, `backtest`, `positions`, `monitor`, `watch`, `lookup-table`, `delever`. |
 
 ## Venues
 
 | Venue | Status |
 |---|---|
-| Kamino Lend | ✅ monitor |
+| Kamino Lend | ✅ monitor · ✅ delever (fork-tested) |
 | Jupiter Lend | ✅ monitor |
 | Project 0 / marginfi, Save | planned |
 
@@ -207,23 +209,76 @@ for details.
 - Trades fill at the bar close with a fixed cost in bps. The live bot will use
   real swap quotes.
 
+## Rebalance a Kamino position (delever)
+
+One atomic transaction, funded by a Kamino flash loan:
+
+```
+flash-borrow USDC → refresh → repay debt → refresh → withdraw SOL
+→ Jupiter swap SOL → USDC → flash-repay
+```
+
+The repay amount is what the swap's **guaranteed** output covers (Jupiter's
+slippage floor, minus the flash fee), so the flash loan can always be repaid;
+any extra output stays in your wallet. Every transaction is simulated first.
+
+```bash
+# One-time per position: a lookup table with its accounts (~0.004 SOL rent).
+# Without it, the swap route doesn't fit in one transaction.
+./target/release/borrowguard lookup-table --position <OBLIGATION> --keypair ~/.config/solana/borrowguard.json
+
+# Simulate what the controller would do (nothing is sent)
+./target/release/borrowguard delever --position <OBLIGATION> --keypair ~/.config/solana/borrowguard.json \
+    --lookup-table <TABLE> --target 3
+
+# Do it
+./target/release/borrowguard delever ... --send
+```
+
+The keypair must be the obligation's owner. Keep it in a file outside the repo
+(it can also come from `BORROWGUARD_KEYPAIR` in `.env`).
+
+### Test on a mainnet fork first
+
+[Surfpool](https://github.com/txtx/surfpool) runs a local copy of mainnet with
+fake money. The test script copies a real obligation into it, hands it to a
+throwaway keypair, and delevers it:
+
+```bash
+surfpool start -u "$RPC_URL" --no-tui --no-deploy        # another terminal
+RPC_URL=... python3 scripts/fork_delever_test.py <KAMINO_OBLIGATION> --target 1.4
+```
+
+```
+sent: sell 0.874558 SOL → ≥90.2472 USDC (quote 90.7007, impact 0.010%), repay 90.2463 USDC, 416032 CU
+leverage now 1.401× (was 1.767×)
+PASS: leverage 1.767× → 1.401× (target 1.4×)
+```
+
+On the fork the script routes swaps through classic pools only
+(`--jupiter-dexes`): proprietary market makers price from off-chain updates a
+frozen fork doesn't receive.
+
 ## Roadmap
 
 1. ✅ Controller core and backtester
 2. ✅ Read-only monitor for Kamino: live leverage, trigger prices, alerts
 3. ✅ Jupiter Lend venue (monitor)
 4. ✅ Watch many positions from one config file
-5. ⬜ Executor: flash-loan delever/relever transactions, tested on a
-   [Surfpool](https://github.com/txtx/surfpool) mainnet fork
+5. 🟡 Executor: ✅ Kamino flash-loan delever, tested on a
+   [Surfpool](https://github.com/txtx/surfpool) mainnet fork · ⬜ relever ·
+   ⬜ automatic rebalancing from `watch`
 6. ⬜ Mainnet with a small position; dry-run by default
 7. ⬜ Stretch: liquidator mode (same building blocks, other people's positions)
 
 ## Safety
 
 - Use a dedicated wallet that holds only the position you want guarded.
-- Keys belong in `.env` or a keypair file outside the repo. Both are gitignored.
-- When the executor lands, it will be dry-run by default. Simulate every
-  transaction before sending it.
+- Keep the signing keypair in a file outside the repo; `.env` and `*.keypair.json`
+  are gitignored.
+- `delever` only simulates unless you pass `--send`, and every transaction is
+  simulated before it is sent.
+- Test on a Surfpool fork before trusting it with real money.
 - This is experimental software that can lose money. No warranty.
 
 ## License
