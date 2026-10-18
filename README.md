@@ -9,7 +9,7 @@ a no-trade band, an emergency "ripcord" and flash-loan rebalancing. It runs
 against a position you own instead of a pooled vault.
 
 > **Status: early.** The controller core, backtester and live monitor (Kamino,
-> Jupiter Lend) work. Kamino **rebalancing in both directions** (delever and
+> Jupiter Lend, Project 0 / marginfi) work. Kamino **rebalancing in both directions** (delever and
 > relever) works, by hand or automatically from `watch --live`, and is tested
 > on a mainnet fork. It has not been run with real money yet.
 
@@ -50,6 +50,7 @@ refresh reserves + obligation → flash-borrow USDC → repay debt
 | `crates/borrowguard-core` | Position math, the controller and the `Venue` trait. No Solana deps; shared by backtester and bot. |
 | `crates/borrowguard-kamino` | Kamino Lend venue: klend account layouts, instruction builders, live snapshots, delever execution. |
 | `crates/borrowguard-jupiter` | Jupiter Lend venue: Fluid vault layouts, exact tick math, live snapshots. |
+| `crates/borrowguard-marginfi` | Project 0 (marginfi v2) venue: account and bank layouts, live snapshots from the risk engine's health cache. |
 | `crates/borrowguard-exec` | Execution plumbing shared by venues: Jupiter swaps, lookup tables, compose / simulate / send. |
 | `crates/borrowguard-cli` | The `borrowguard` binary: `fetch-prices`, `backtest`, `positions`, `monitor`, `watch`, `lookup-table`, `rebalance`. |
 
@@ -59,7 +60,8 @@ refresh reserves + obligation → flash-borrow USDC → repay debt
 |---|---|
 | Kamino Lend | ✅ monitor · ✅ delever + relever, manual or automatic (fork-tested) |
 | Jupiter Lend | ✅ monitor |
-| Project 0 / marginfi, Save | planned |
+| Project 0 / marginfi | ✅ monitor |
+| Save | planned |
 
 Each venue implements `borrowguard_core::Venue`, returning a `Snapshot`:
 collateral and debt amounts, prices, and the venue's own liquidation and
@@ -89,7 +91,7 @@ LTV, cost, borrow APR, trade caps and liquidation bonus.
 ```bash
 cp .env.example .env   # optional: RPC_URL and alert credentials
 
-# Find your Kamino obligations and Jupiter Lend positions
+# Find your Kamino, Project 0 / marginfi and Jupiter Lend positions
 ./target/release/borrowguard positions --owner <YOUR_WALLET>
 
 # Check once, or keep watching every 10s. The venue is detected from the account.
@@ -114,6 +116,14 @@ controller  target 3× band ±0.15 ripcord 3.6× (dry run: nothing is traded)
 19:39:44  SOL/USDC 108.1160  lev 3.888×  LTV 74.3%  ripcord@ 111.1921 (+2.8%)  liq@ 94.4769 (-12.6%)  → RIPCORD sell 5393.20 USDC of SOL, repay debt
 ```
 
+And for a SOL/USDC account on Project 0 / marginfi (2026-10-19), default 3× settings:
+
+```
+marginfi  SOL/USDC  liquidation at 7.04× (LTV 85.8%), borrow limit 3.67× (LTV 72.7%)
+controller  target 3× band ±0.15 ripcord 3.6× (monitor only: nothing is traded)
+19:08:26  SOL/USDC 101.7669  lev 2.136×  LTV 53.2%  ripcord@ 74.9371 (-26.4%)  liq@ 63.0872 (-38.0%)  → RELEVER borrow 1.33 USDC, buy SOL
+```
+
 How the monitor gets its numbers: it asks each protocol to do its own math by
 simulating its instructions, which costs nothing and needs no signature.
 
@@ -126,9 +136,14 @@ simulating its instructions, which costs nothing and needs no signature.
   `get_exchange_rate_liquidate` view (the price the vault liquidates on). A
   position whose tick was already liquidated is reported as unsupported rather
   than shown with wrong numbers.
+- **Project 0 / marginfi:** simulates `lending_account_pulse_health` with each
+  bank's oracle accounts and decodes the account's fresh health cache. The risk
+  engine does the oracle reads, weights, e-mode boosts and confidence
+  haircuts; the liquidation LTV comes from the values it compares.
 
 `--payer` is the fee payer for those simulations: any wallet with a little SOL,
-normally your own. Kamino defaults it to the obligation owner. Jupiter finds
+normally your own. Kamino and marginfi default it to the position's owner,
+which fails if that wallet holds no SOL. Jupiter finds
 the position's NFT holder, a lookup the public RPC throttles, so pass
 `--payer` there or use a dedicated RPC.
 
@@ -304,12 +319,13 @@ frozen fork doesn't receive.
 1. ✅ Controller core and backtester
 2. ✅ Read-only monitor for Kamino: live leverage, trigger prices, alerts
 3. ✅ Jupiter Lend venue (monitor)
-4. ✅ Watch many positions from one config file
-5. ✅ Executor for Kamino: flash-loan delever and relever, manual
+4. ✅ Project 0 / marginfi venue (monitor)
+5. ✅ Watch many positions from one config file
+6. ✅ Executor for Kamino: flash-loan delever and relever, manual
    (`rebalance`) or automatic (`watch --live`), tested on a
    [Surfpool](https://github.com/txtx/surfpool) mainnet fork
-6. ⬜ Mainnet with a small position; dry-run by default
-7. ⬜ Stretch: liquidator mode (same building blocks, other people's positions)
+7. ⬜ Mainnet with a small position; dry-run by default
+8. ⬜ Stretch: liquidator mode (same building blocks, other people's positions)
 
 ## Safety
 
