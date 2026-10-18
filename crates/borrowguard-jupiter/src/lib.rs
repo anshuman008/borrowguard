@@ -243,25 +243,7 @@ pub fn snapshot_from(
 
 /// Display symbol for common mints; otherwise the mint's first characters.
 fn symbol(mint: &Pubkey) -> String {
-    let known = [
-        ("So11111111111111111111111111111111111111112", "SOL"),
-        ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "USDC"),
-        ("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", "USDT"),
-        ("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn", "JITOSOL"),
-        ("jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v", "JUPSOL"),
-        ("mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So", "MSOL"),
-        ("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", "JUP"),
-        ("cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", "CBBTC"),
-        ("3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh", "WBTC"),
-        ("27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4", "JLP"),
-        ("2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH", "USDG"),
-        ("HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr", "EURC"),
-    ];
-    let mint = mint.to_string();
-    known
-        .iter()
-        .find(|(m, _)| *m == mint)
-        .map_or_else(|| format!("{}…", &mint[..4]), |(_, s)| s.to_string())
+    borrowguard_core::token::symbol(&mint.to_string())
 }
 
 /// A position found by [`find_positions`], with its vault's pair.

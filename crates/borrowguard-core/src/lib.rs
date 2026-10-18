@@ -4,6 +4,7 @@
 
 pub mod controller;
 pub mod position;
+pub mod token;
 pub mod venue;
 
 pub use controller::{Action, Params, ParamsError};
