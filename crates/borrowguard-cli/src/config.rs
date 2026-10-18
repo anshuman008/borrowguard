@@ -14,8 +14,14 @@
 //! ```
 //!
 //! Unknown keys are rejected so a typo can't silently fall back to a default.
+//!
+//! Automatic rebalancing is opt-in per position (`execute = true`) and needs
+//! an `[execution]` table; `watch` still only simulates unless run with `--live`.
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, ensure, Context, Result};
 use borrowguard_kamino::Pubkey;
@@ -27,6 +33,7 @@ use crate::monitor::Controller;
 #[serde(deny_unknown_fields)]
 struct File {
     interval_secs: Option<u64>,
+    execution: Option<Execution>,
     #[serde(default)]
     defaults: Entry,
     #[serde(default, rename = "position")]
@@ -47,11 +54,61 @@ struct Entry {
     ripcord_cost_bps: Option<f64>,
     max_trade: Option<f64>,
     min_trade: Option<f64>,
+    execute: Option<bool>,
+    lookup_table: Option<String>,
+}
+
+/// How automatic rebalances are signed and sent.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Execution {
+    /// Keypair file of the positions' owner, kept outside the repo.
+    pub keypair: PathBuf,
+    #[serde(default = "Execution::default_slippage")]
+    pub slippage_bps: u16,
+    #[serde(default = "Execution::default_ripcord_slippage")]
+    pub ripcord_slippage_bps: u16,
+    /// Micro-lamports per compute unit.
+    #[serde(default = "Execution::default_priority_fee")]
+    pub priority_fee: u64,
+    /// Minimum seconds between trades on one position.
+    #[serde(default = "Execution::default_cooldown")]
+    pub cooldown_secs: u64,
+    /// Most trades one position may send in 24 hours.
+    #[serde(default = "Execution::default_max_trades")]
+    pub max_trades_per_day: usize,
+    /// While this file exists, no trades are sent or simulated.
+    #[serde(default = "Execution::default_kill_switch")]
+    pub kill_switch: PathBuf,
+    pub jupiter_url: Option<String>,
+    pub jupiter_dexes: Option<String>,
+}
+
+impl Execution {
+    fn default_slippage() -> u16 {
+        50
+    }
+    fn default_ripcord_slippage() -> u16 {
+        150
+    }
+    fn default_priority_fee() -> u64 {
+        50_000
+    }
+    fn default_cooldown() -> u64 {
+        120
+    }
+    fn default_max_trades() -> usize {
+        24
+    }
+    fn default_kill_switch() -> PathBuf {
+        PathBuf::from("STOP")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WatchConfig {
     pub interval_secs: u64,
+    pub execution: Option<Execution>,
     pub positions: Vec<PositionConfig>,
 }
 
@@ -61,6 +118,10 @@ pub struct PositionConfig {
     pub label: String,
     pub payer: Option<Pubkey>,
     pub controller: Controller,
+    /// Rebalance automatically (still simulate-only without `watch --live`).
+    pub execute: bool,
+    /// Lookup table with the position's accounts; required to execute.
+    pub lookup_table: Option<Pubkey>,
 }
 
 pub fn load(path: &Path) -> Result<WatchConfig> {
@@ -112,10 +173,30 @@ pub fn parse(text: &str) -> Result<WatchConfig> {
                 min_trade: pick(p.min_trade, d.min_trade, base.min_trade),
             };
             let label = p.label.clone().unwrap_or_else(|| short(&address));
-            Ok(PositionConfig { address, label, payer, controller })
+            let execute = p.execute.or(d.execute).unwrap_or(false);
+            let lookup_table = p
+                .lookup_table
+                .as_ref()
+                .map(|k| k.parse().with_context(|| format!("{label}: bad lookup_table")))
+                .transpose()?;
+            if execute {
+                ensure!(
+                    file.execution.is_some(),
+                    "{label}: execute = true needs an [execution] table with a keypair"
+                );
+                ensure!(
+                    lookup_table.is_some(),
+                    "{label}: execute = true needs a lookup_table (create one with `borrowguard lookup-table`)"
+                );
+            }
+            Ok(PositionConfig { address, label, payer, controller, execute, lookup_table })
         })
         .collect::<Result<_>>()?;
-    Ok(WatchConfig { interval_secs: file.interval_secs.unwrap_or(10), positions })
+    Ok(WatchConfig {
+        interval_secs: file.interval_secs.unwrap_or(10),
+        execution: file.execution,
+        positions,
+    })
 }
 
 /// `2w9MS6MB…TxAG`-style label for positions without one.
@@ -177,6 +258,27 @@ mod tests {
         for text in bad {
             assert!(parse(&text).is_err(), "should reject:\n{text}");
         }
+    }
+
+    #[test]
+    fn execution_is_opt_in_and_validated() {
+        let base = format!("[[position]]\naddress = \"{KAMINO}\"\n");
+        assert!(!parse(&base).unwrap().positions[0].execute);
+
+        let needs_table = format!("[execution]\nkeypair = \"k.json\"\n{base}execute = true\n");
+        assert!(parse(&needs_table).unwrap_err().to_string().contains("lookup_table"));
+
+        let needs_keypair = format!("{base}execute = true\nlookup_table = \"{JUPITER}\"\n");
+        assert!(parse(&needs_keypair).unwrap_err().to_string().contains("[execution]"));
+
+        let ok = format!(
+            "[execution]\nkeypair = \"k.json\"\ncooldown_secs = 30\n{base}execute = true\nlookup_table = \"{JUPITER}\"\n"
+        );
+        let cfg = parse(&ok).unwrap();
+        let exec = cfg.execution.unwrap();
+        assert_eq!((exec.cooldown_secs, exec.slippage_bps, exec.max_trades_per_day), (30, 50, 24));
+        assert_eq!(exec.kill_switch, PathBuf::from("STOP"));
+        assert!(cfg.positions[0].execute);
     }
 
     #[test]

@@ -8,8 +8,9 @@
 id.json
 keypairs/
 
-# Your positions (start from borrowguard.example.toml)
+# Your positions (start from borrowguard.example.toml) and the kill switch
 /borrowguard.toml
+/STOP
 
 # Downloaded price data (regenerate with `borrowguard fetch-prices`)
 /data

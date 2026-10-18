@@ -18,7 +18,7 @@ use solana_client::rpc_client::RpcClient;
 
 use crate::alerts::Notifier;
 use crate::backtest::{Report, SimConfig};
-use crate::monitor::{Controller, Watched};
+use crate::monitor::{AutoExec, Controller, Watched};
 
 #[derive(Parser)]
 #[command(name = "borrowguard", version, about = "Keep a lending position at a target leverage")]
@@ -222,6 +222,10 @@ struct WatchArgs {
     /// Check every position once and exit (non-zero if any failed).
     #[arg(long)]
     once: bool,
+    /// Send rebalances for positions with `execute = true`. Without it they
+    /// are only simulated.
+    #[arg(long)]
+    live: bool,
     #[command(flatten)]
     alerts: AlertArgs,
 }
@@ -516,25 +520,93 @@ fn run_monitor(args: MonitorArgs) -> Result<()> {
 
 fn run_watch(args: WatchArgs) -> Result<()> {
     let cfg = config::load(&args.config)?;
+    let rpc_url = &args.rpc.rpc_url;
+    let signer = match (&cfg.execution, cfg.positions.iter().any(|p| p.execute)) {
+        (Some(exec), true) => Some(load_keypair(&exec.keypair)?),
+        _ => None,
+    };
     let mut watched = Vec::with_capacity(cfg.positions.len());
     for p in cfg.positions {
-        let venue = open_venue(&args.rpc.rpc_url, p.address, p.payer)
+        let venue = open_venue(rpc_url, p.address, p.payer)
             .with_context(|| format!("position \"{}\"", p.label))?;
         println!("  {:<24} {:<8} {}", p.label, venue.name(), p.address);
-        watched.push(Watched::new(p.label, venue, p.controller));
+        let mut entry = Watched::new(p.label.clone(), venue, p.controller);
+        if p.execute {
+            let (exec, signer) = (cfg.execution.as_ref().unwrap(), signer.as_ref().unwrap());
+            entry = entry.with_auto(auto_exec(rpc_url, &p, exec, signer, args.live)?);
+        }
+        watched.push(entry);
     }
     let interval = args.interval.unwrap_or(cfg.interval_secs);
     let notifier = args.alerts.notifier();
+    let trading = watched.iter().filter(|w| w.auto.is_some()).count();
     println!(
-        "watching {} positions every {interval}s, alerts: {}\n",
+        "watching {} positions every {interval}s, alerts: {}",
         watched.len(),
         channels(&notifier)
     );
+    if trading > 0 {
+        match args.live {
+            true => {
+                println!("LIVE: auto-rebalance sends real transactions for {trading} position(s)")
+            }
+            false => {
+                println!("auto-rebalance simulated for {trading} position(s); add --live to send")
+            }
+        }
+    }
+    println!();
     monitor::run(
         &mut watched,
         &notifier,
         monitor::Settings { interval: Duration::from_secs(interval), once: args.once },
     )
+}
+
+/// Executor for one `execute = true` position, checked before the loop starts
+/// so a misconfiguration fails now rather than mid-crash.
+fn auto_exec(
+    rpc_url: &str,
+    p: &config::PositionConfig,
+    exec: &config::Execution,
+    signer: &solana_sdk::signature::Keypair,
+    live: bool,
+) -> Result<AutoExec> {
+    let owner = solana_sdk::signer::Signer::pubkey(signer);
+    let account = RpcClient::new(rpc_url.to_string()).get_account(&p.address)?;
+    ensure!(
+        account.owner == borrowguard_kamino::PROGRAM_ID,
+        "{}: automatic rebalancing is only implemented for Kamino so far",
+        p.label
+    );
+    let kamino = KaminoVenue::new(rpc_url, p.address, Some(owner));
+    let position_owner = kamino.owner()?;
+    ensure!(
+        position_owner == owner,
+        "{}: keypair {owner} doesn't own this position (owner {position_owner})",
+        p.label
+    );
+    let ctx = ExecContext {
+        rpc: ExecContext::rpc(rpc_url),
+        signer: solana_sdk::signature::Keypair::from_bytes(&signer.to_bytes())?,
+        jupiter: Jupiter::new(
+            exec.jupiter_url.as_deref().unwrap_or(borrowguard_exec::jupiter::DEFAULT_URL),
+            std::env::var("JUPITER_API_KEY").ok(),
+            exec.jupiter_dexes.clone(),
+        ),
+        slippage_bps: exec.slippage_bps,
+        ripcord_slippage_bps: exec.ripcord_slippage_bps,
+        priority_fee: exec.priority_fee,
+        lookup_tables: p.lookup_table.into_iter().collect(),
+        send: live,
+    };
+    Ok(AutoExec::new(
+        Box::new(kamino),
+        ctx,
+        Duration::from_secs(exec.cooldown_secs),
+        exec.max_trades_per_day,
+        exec.kill_switch.clone(),
+    ))
 }
 
 fn run_rebalance(args: RebalanceArgs) -> Result<()> {

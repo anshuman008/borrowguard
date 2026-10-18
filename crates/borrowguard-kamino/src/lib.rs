@@ -42,6 +42,11 @@ pub struct KaminoVenue {
 }
 
 impl KaminoVenue {
+    /// The wallet that owns the obligation (and must sign its rebalances).
+    pub fn owner(&self) -> Result<Pubkey> {
+        Ok(parse_obligation(&self.rpc.get_account_data(&self.obligation)?)?.owner)
+    }
+
     pub fn new(rpc_url: &str, obligation: Pubkey, payer: Option<Pubkey>) -> Self {
         let rpc =
             RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::confirmed());
