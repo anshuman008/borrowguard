@@ -8,7 +8,7 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{ensure, Context, Result};
 use borrowguard_core::Venue;
-use borrowguard_core::{leverage_from_ltv, Params};
+use borrowguard_core::{leverage_from_ltv, Action, Params};
 use borrowguard_exec::{jupiter::Jupiter, load_keypair, ExecContext, Execute, Executed};
 use borrowguard_jupiter::JupiterVenue;
 use borrowguard_kamino::{KaminoVenue, Pubkey};
@@ -42,9 +42,11 @@ enum Cmd {
     /// Watch every position listed in a config file (see borrowguard.example.toml).
     /// Read-only: never sends a transaction.
     Watch(WatchArgs),
-    /// Delever a Kamino position now: flash loan, repay, withdraw, swap.
-    /// Simulates only unless --send is given.
-    Delever(DeleverArgs),
+    /// Rebalance a Kamino position now, in whichever direction the controller
+    /// decides (delever or relever), funded by a flash loan. Simulates only
+    /// unless --send is given.
+    #[command(alias = "delever")]
+    Rebalance(RebalanceArgs),
     /// Create an address lookup table with a position's accounts (one-time,
     /// ~0.004 SOL rent). Rebalances need it to fit a swap route.
     LookupTable(LookupTableArgs),
@@ -225,8 +227,8 @@ struct WatchArgs {
 }
 
 #[derive(Args)]
-struct DeleverArgs {
-    /// Kamino obligation to delever; the keypair must be its owner.
+struct RebalanceArgs {
+    /// Kamino obligation to rebalance; the keypair must be its owner.
     #[arg(long, alias = "obligation")]
     position: Pubkey,
     /// Owner's Solana keypair file (JSON), kept outside the repo.
@@ -234,10 +236,14 @@ struct DeleverArgs {
     keypair: PathBuf,
     #[command(flatten)]
     rpc: RpcArgs,
-    /// Debt-token value of collateral to sell. Without it, the controller
-    /// decides (and does nothing if the position is inside its band).
-    #[arg(long)]
+    /// Force a delever: debt-token value of collateral to sell.
+    #[arg(long, conflicts_with = "borrow")]
     sell: Option<f64>,
+    /// Force a relever: debt tokens to borrow and turn into collateral.
+    /// Without --sell or --borrow, the controller decides (and does nothing
+    /// if the position is inside its band).
+    #[arg(long)]
+    borrow: Option<f64>,
     #[command(flatten)]
     controller: ControllerArgs,
     #[arg(long, default_value_t = Controller::DEFAULT.band)]
@@ -297,7 +303,7 @@ fn main() -> Result<()> {
         Cmd::Positions(args) => positions(args),
         Cmd::Monitor(args) => run_monitor(args),
         Cmd::Watch(args) => run_watch(args),
-        Cmd::Delever(args) => run_delever(args),
+        Cmd::Rebalance(args) => run_rebalance(args),
         Cmd::LookupTable(args) => run_lookup_table(args),
     }
 }
@@ -531,37 +537,47 @@ fn run_watch(args: WatchArgs) -> Result<()> {
     )
 }
 
-fn run_delever(args: DeleverArgs) -> Result<()> {
+fn run_rebalance(args: RebalanceArgs) -> Result<()> {
     let signer = load_keypair(&args.keypair)?;
     let owner = solana_sdk::signer::Signer::pubkey(&signer);
     let rpc_url = &args.rpc.rpc_url;
     let venue = open_venue(rpc_url, args.position, Some(owner))?;
-    ensure!(venue.name() == "kamino", "delever is only implemented for Kamino so far");
+    ensure!(venue.name() == "kamino", "rebalancing is only implemented for Kamino so far");
     let kamino = KaminoVenue::new(rpc_url, args.position, Some(owner));
 
     let snap = kamino.snapshot()?;
     let params = args.controller.params(args.band, snap.liquidation_leverage());
-    let (sell, ripcord) = match args.sell {
-        Some(sell) => (sell, false),
-        None => match params.decide(&snap.position(), snap.price()) {
-            borrowguard_core::Action::Delever { sell, ripcord } => (sell, ripcord),
-            other => {
-                println!("controller says {other:?}; nothing to delever (pass --sell to force)");
-                return Ok(());
-            }
-        },
+    let action = match (args.sell, args.borrow) {
+        (Some(sell), _) => Action::Delever { sell, ripcord: false },
+        (_, Some(borrow)) => Action::Relever { borrow },
+        _ => params.decide(&snap.position(), snap.price()),
     };
     let leverage = snap.position().leverage(snap.price()).unwrap_or(f64::INFINITY);
+    let (coll, debt) = (&snap.collateral_symbol, &snap.debt_symbol);
+    let plan = match action {
+        Action::Delever { sell, ripcord } => {
+            format!(
+                "{}delever {sell:.4} {debt} worth of {coll}",
+                if ripcord { "RIPCORD " } else { "" }
+            )
+        }
+        Action::Relever { borrow } => format!("relever: borrow {borrow:.4} {debt}, buy {coll}"),
+        other => {
+            println!("{coll}/{debt} at {leverage:.3}×: controller says {other:?}; nothing to do");
+            return Ok(());
+        }
+    };
     println!(
-        "{}/{} at {leverage:.3}×: delever {sell:.4} {} worth of {}{}",
-        snap.collateral_symbol,
-        snap.debt_symbol,
-        snap.debt_symbol,
-        snap.collateral_symbol,
+        "{coll}/{debt} at {leverage:.3}×: {plan}{}",
         if args.exec.send { "" } else { " (simulation only; add --send to execute)" }
     );
     let ctx = args.exec.context(rpc_url, signer);
-    match kamino.delever(&ctx, sell, ripcord)? {
+    let result = match action {
+        Action::Delever { sell, ripcord } => kamino.delever(&ctx, sell, ripcord)?,
+        Action::Relever { borrow } => kamino.relever(&ctx, borrow)?,
+        _ => unreachable!("handled above"),
+    };
+    match result {
         Executed::Simulated { summary, .. } => println!("simulated ok: {summary}"),
         Executed::Sent { signature, summary } => {
             println!("sent: {summary}\nsignature: {signature}");
