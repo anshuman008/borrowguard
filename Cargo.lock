@@ -488,6 +488,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "borrowguard-core",
+ "borrowguard-exec",
  "borrowguard-jupiter",
  "borrowguard-kamino",
  "chrono",
@@ -498,6 +499,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solana-client",
+ "solana-sdk",
  "toml 0.8.23",
 ]
 

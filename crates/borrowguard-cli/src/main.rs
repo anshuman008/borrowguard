@@ -9,6 +9,7 @@ use std::{path::PathBuf, time::Duration};
 use anyhow::{ensure, Context, Result};
 use borrowguard_core::Venue;
 use borrowguard_core::{leverage_from_ltv, Params};
+use borrowguard_exec::{jupiter::Jupiter, load_keypair, ExecContext, Execute, Executed};
 use borrowguard_jupiter::JupiterVenue;
 use borrowguard_kamino::{KaminoVenue, Pubkey};
 use chrono::{DateTime, Utc};
@@ -41,6 +42,24 @@ enum Cmd {
     /// Watch every position listed in a config file (see borrowguard.example.toml).
     /// Read-only: never sends a transaction.
     Watch(WatchArgs),
+    /// Delever a Kamino position now: flash loan, repay, withdraw, swap.
+    /// Simulates only unless --send is given.
+    Delever(DeleverArgs),
+    /// Create an address lookup table with a position's accounts (one-time,
+    /// ~0.004 SOL rent). Rebalances need it to fit a swap route.
+    LookupTable(LookupTableArgs),
+}
+
+#[derive(Args)]
+struct LookupTableArgs {
+    #[arg(long, alias = "obligation")]
+    position: Pubkey,
+    #[arg(long, env = "BORROWGUARD_KEYPAIR")]
+    keypair: PathBuf,
+    #[command(flatten)]
+    rpc: RpcArgs,
+    #[arg(long, default_value_t = 50_000)]
+    priority_fee: u64,
 }
 
 /// Controller settings shared by `backtest` and `monitor`.
@@ -205,6 +224,71 @@ struct WatchArgs {
     alerts: AlertArgs,
 }
 
+#[derive(Args)]
+struct DeleverArgs {
+    /// Kamino obligation to delever; the keypair must be its owner.
+    #[arg(long, alias = "obligation")]
+    position: Pubkey,
+    /// Owner's Solana keypair file (JSON), kept outside the repo.
+    #[arg(long, env = "BORROWGUARD_KEYPAIR")]
+    keypair: PathBuf,
+    #[command(flatten)]
+    rpc: RpcArgs,
+    /// Debt-token value of collateral to sell. Without it, the controller
+    /// decides (and does nothing if the position is inside its band).
+    #[arg(long)]
+    sell: Option<f64>,
+    #[command(flatten)]
+    controller: ControllerArgs,
+    #[arg(long, default_value_t = Controller::DEFAULT.band)]
+    band: f64,
+    #[command(flatten)]
+    exec: ExecArgs,
+}
+
+/// How trades are executed.
+#[derive(Args)]
+struct ExecArgs {
+    /// Actually send the transaction. Without it, it is only simulated.
+    #[arg(long)]
+    send: bool,
+    /// Max swap slippage for routine trades, basis points.
+    #[arg(long, default_value_t = 50)]
+    slippage_bps: u16,
+    /// Max swap slippage for ripcord trades, basis points.
+    #[arg(long, default_value_t = 150)]
+    ripcord_slippage_bps: u16,
+    /// Priority fee, micro-lamports per compute unit.
+    #[arg(long, default_value_t = 50_000)]
+    priority_fee: u64,
+    /// Extra address lookup table(s) holding the position's accounts.
+    #[arg(long = "lookup-table")]
+    lookup_tables: Vec<Pubkey>,
+    #[arg(long, env = "JUPITER_URL", default_value = borrowguard_exec::jupiter::DEFAULT_URL)]
+    jupiter_url: String,
+    #[arg(long, env = "JUPITER_API_KEY", hide_env_values = true)]
+    jupiter_api_key: Option<String>,
+    /// Only swap through these DEXes, e.g. "Whirlpool,Raydium CLMM,Meteora DLMM".
+    /// Default: any, for the best price.
+    #[arg(long)]
+    jupiter_dexes: Option<String>,
+}
+
+impl ExecArgs {
+    fn context(self, rpc_url: &str, signer: solana_sdk::signature::Keypair) -> ExecContext {
+        ExecContext {
+            rpc: ExecContext::rpc(rpc_url),
+            signer,
+            jupiter: Jupiter::new(&self.jupiter_url, self.jupiter_api_key, self.jupiter_dexes),
+            slippage_bps: self.slippage_bps,
+            ripcord_slippage_bps: self.ripcord_slippage_bps,
+            priority_fee: self.priority_fee,
+            lookup_tables: self.lookup_tables,
+            send: self.send,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     match Cli::parse().cmd {
@@ -213,6 +297,8 @@ fn main() -> Result<()> {
         Cmd::Positions(args) => positions(args),
         Cmd::Monitor(args) => run_monitor(args),
         Cmd::Watch(args) => run_watch(args),
+        Cmd::Delever(args) => run_delever(args),
+        Cmd::LookupTable(args) => run_lookup_table(args),
     }
 }
 
@@ -443,6 +529,61 @@ fn run_watch(args: WatchArgs) -> Result<()> {
         &notifier,
         monitor::Settings { interval: Duration::from_secs(interval), once: args.once },
     )
+}
+
+fn run_delever(args: DeleverArgs) -> Result<()> {
+    let signer = load_keypair(&args.keypair)?;
+    let owner = solana_sdk::signer::Signer::pubkey(&signer);
+    let rpc_url = &args.rpc.rpc_url;
+    let venue = open_venue(rpc_url, args.position, Some(owner))?;
+    ensure!(venue.name() == "kamino", "delever is only implemented for Kamino so far");
+    let kamino = KaminoVenue::new(rpc_url, args.position, Some(owner));
+
+    let snap = kamino.snapshot()?;
+    let params = args.controller.params(args.band, snap.liquidation_leverage());
+    let (sell, ripcord) = match args.sell {
+        Some(sell) => (sell, false),
+        None => match params.decide(&snap.position(), snap.price()) {
+            borrowguard_core::Action::Delever { sell, ripcord } => (sell, ripcord),
+            other => {
+                println!("controller says {other:?}; nothing to delever (pass --sell to force)");
+                return Ok(());
+            }
+        },
+    };
+    let leverage = snap.position().leverage(snap.price()).unwrap_or(f64::INFINITY);
+    println!(
+        "{}/{} at {leverage:.3}×: delever {sell:.4} {} worth of {}{}",
+        snap.collateral_symbol,
+        snap.debt_symbol,
+        snap.debt_symbol,
+        snap.collateral_symbol,
+        if args.exec.send { "" } else { " (simulation only; add --send to execute)" }
+    );
+    let ctx = args.exec.context(rpc_url, signer);
+    match kamino.delever(&ctx, sell, ripcord)? {
+        Executed::Simulated { summary, .. } => println!("simulated ok: {summary}"),
+        Executed::Sent { signature, summary } => {
+            println!("sent: {summary}\nsignature: {signature}");
+            let after = kamino.snapshot()?;
+            let lev = after.position().leverage(after.price()).unwrap_or(f64::INFINITY);
+            println!("leverage now {lev:.3}× (was {leverage:.3}×)");
+        }
+    }
+    Ok(())
+}
+
+fn run_lookup_table(args: LookupTableArgs) -> Result<()> {
+    let signer = load_keypair(&args.keypair)?;
+    let owner = solana_sdk::signer::Signer::pubkey(&signer);
+    let kamino = KaminoVenue::new(&args.rpc.rpc_url, args.position, Some(owner));
+    let addresses = kamino.static_accounts(&owner)?;
+    println!("creating a lookup table with {} accounts for {}", addresses.len(), args.position);
+    let rpc = ExecContext::rpc(&args.rpc.rpc_url);
+    let table =
+        borrowguard_exec::tx::create_lookup_table(&rpc, &signer, &addresses, args.priority_fee)?;
+    println!("lookup table: {table}\nuse it with: --lookup-table {table}");
+    Ok(())
 }
 
 fn channels(notifier: &Notifier) -> String {
