@@ -8,6 +8,8 @@
 //! - oracle `get_exchange_rate_liquidate`: the exact price the vault
 //!   liquidates on (fails if any oracle source is stale).
 
+pub mod exec;
+pub mod ix;
 pub mod layout;
 pub mod tick;
 
@@ -32,12 +34,12 @@ use solana_sdk::{commitment_config::CommitmentConfig, message::Message, transact
 
 use crate::layout::{
     discriminator, parse_oracle, parse_position, parse_tick, parse_vault_config,
-    token_account_owner, Position, VaultConfig, POSITION_ACCOUNT_LEN, POSITION_MINT_OFFSET,
+    token_account_owner, Oracle, Position, Tick, VaultConfig, POSITION_ACCOUNT_LEN,
+    POSITION_MINT_OFFSET,
 };
 
-pub const VAULTS_PROGRAM_ID: Pubkey = pubkey!("jupr81YtYssSyPt8jbnGuiWon5f6x9TcDEFxYe3Bdzi");
-pub const LIQUIDITY_PROGRAM_ID: Pubkey = pubkey!("jupeiUmn818Jg1ekPURTpr4mFo29p46vygyykFJ3wZC");
-pub const ORACLE_PROGRAM_ID: Pubkey = pubkey!("jupnw4B6Eqs7ft6rxpzYLJZYSnrpRgPcr589n5Kv4oc");
+pub use crate::ix::{position_pda, LIQUIDITY_PROGRAM_ID, ORACLE_PROGRAM_ID, VAULTS_PROGRAM_ID};
+use crate::ix::{tick_pda, token_reserve_pda, vault_config_pda, vault_state_pda};
 
 /// Vault amounts are scaled to 9 decimals regardless of the token's own.
 const AMOUNT_SCALE: f64 = 1e9;
@@ -49,32 +51,6 @@ const TOKEN_PROGRAMS: [Pubkey; 2] = [
     pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
     pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"),
 ];
-
-pub fn position_pda(vault_id: u16, nft_id: u32) -> Pubkey {
-    vault_pda(&[b"position", &vault_id.to_le_bytes(), &nft_id.to_le_bytes()])
-}
-
-fn vault_pda(seeds: &[&[u8]]) -> Pubkey {
-    Pubkey::find_program_address(seeds, &VAULTS_PROGRAM_ID).0
-}
-
-fn vault_config_pda(vault_id: u16) -> Pubkey {
-    vault_pda(&[b"vault_config", &vault_id.to_le_bytes()])
-}
-
-fn vault_state_pda(vault_id: u16) -> Pubkey {
-    vault_pda(&[b"vault_state", &vault_id.to_le_bytes()])
-}
-
-fn tick_pda(vault_id: u16, tick: i32) -> Pubkey {
-    // Ticks are seeded as `tick + MAX_TICK` so the seed is non-negative.
-    let encoded = (tick + tick::MAX_TICK) as u32;
-    vault_pda(&[b"tick", &vault_id.to_le_bytes(), &encoded.to_le_bytes()])
-}
-
-fn token_reserve_pda(mint: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"reserve", mint.as_ref()], &LIQUIDITY_PROGRAM_ID).0
-}
 
 pub struct JupiterVenue {
     rpc: RpcClient,
@@ -118,12 +94,33 @@ impl JupiterVenue {
     }
 }
 
+/// A position and its vault, priced as the vault program sees them now.
+pub(crate) struct Reading {
+    pub pos: Position,
+    pub config: VaultConfig,
+    pub tick: Tick,
+    pub oracle: Oracle,
+    /// Vault supply / borrow exchange prices, 1e12, interest accrued to now.
+    pub supply_ex: u128,
+    pub borrow_ex: u128,
+    /// Collateral price in debt tokens, 1e15.
+    pub rate: u128,
+    pub slot: u64,
+}
+
 impl Venue for JupiterVenue {
     fn name(&self) -> &str {
         "jupiter"
     }
 
     fn snapshot(&self) -> Result<Snapshot> {
+        let r = self.read()?;
+        snapshot_from(&r.pos, &r.config, r.supply_ex, r.borrow_ex, r.rate, r.slot)
+    }
+}
+
+impl JupiterVenue {
+    pub(crate) fn read(&self) -> Result<Reading> {
         let data = self.rpc.get_account_data(&self.position).with_context(|| {
             format!("fetch position {} (closed, or not a mainnet address?)", self.position)
         })?;
@@ -178,7 +175,7 @@ impl Venue for JupiterVenue {
             Instruction {
                 program_id: ORACLE_PROGRAM_ID,
                 accounts: std::iter::once(config.oracle)
-                    .chain(oracle.sources)
+                    .chain(oracle.sources.iter().copied())
                     .map(|k| AccountMeta::new_readonly(k, false))
                     .collect(),
                 data: [
@@ -190,11 +187,15 @@ impl Venue for JupiterVenue {
             &payer,
         )?;
         let rate = u128::from_le_bytes(rate.try_into().ok().context("oracle rate is not a u128")?);
-        snapshot_from(&pos, &config, supply_ex, borrow_ex, rate, slot)
+        Ok(Reading { pos, config, tick, oracle, supply_ex, borrow_ex, rate, slot })
     }
-}
 
-impl JupiterVenue {
+    /// The wallet holding the position's NFT, which controls the position.
+    pub fn owner(&self) -> Result<Pubkey> {
+        let pos = parse_position(&self.rpc.get_account_data(&self.position)?)?;
+        self.nft_holder(&pos.position_mint)
+    }
+
     /// Wallet holding the position NFT (the position's owner).
     fn nft_holder(&self, mint: &Pubkey) -> Result<Pubkey> {
         let holders = self.rpc.get_token_largest_accounts(mint).context(

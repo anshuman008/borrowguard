@@ -532,6 +532,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "borrowguard-core",
+ "borrowguard-exec",
  "solana-account-decoder",
  "solana-client",
  "solana-program",
