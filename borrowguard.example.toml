@@ -7,7 +7,7 @@
 # Seconds between checks.
 interval_secs = 10
 
-# Automatic rebalancing (Kamino only so far). Positions opt in with
+# Automatic rebalancing (Kamino and Jupiter Lend). Positions opt in with
 # `execute = true`, and nothing is sent unless `watch` runs with --live.
 # [execution]
 # keypair = "~/.config/solana/borrowguard.json"  # owner of the positions; keep outside the repo

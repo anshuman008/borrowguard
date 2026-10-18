@@ -44,7 +44,7 @@ enum Cmd {
     /// Watch every position listed in a config file (see borrowguard.example.toml).
     /// Read-only: never sends a transaction.
     Watch(WatchArgs),
-    /// Rebalance a Kamino position now, in whichever direction the controller
+    /// Rebalance a Kamino or Jupiter Lend position now, in whichever direction the controller
     /// decides (delever or relever), funded by a flash loan. Simulates only
     /// unless --send is given.
     #[command(alias = "delever")]
@@ -235,7 +235,8 @@ struct WatchArgs {
 
 #[derive(Args)]
 struct RebalanceArgs {
-    /// Kamino obligation to rebalance; the keypair must be its owner.
+    /// Kamino obligation or Jupiter Lend position to rebalance; the keypair
+    /// must own it.
     #[arg(long, alias = "obligation")]
     position: Pubkey,
     /// Owner's Solana keypair file (JSON), kept outside the repo.
@@ -565,6 +566,35 @@ fn open_venue(rpc_url: &str, position: Pubkey, payer: Option<Pubkey>) -> Result<
     }
 }
 
+/// A venue BorrowGuard can rebalance on, not just watch.
+trait Rebalancer: Venue + Execute {}
+impl<T: Venue + Execute> Rebalancer for T {}
+
+/// Open a position for rebalancing by `owner`, checking that `owner` controls it.
+fn open_rebalancer(rpc_url: &str, position: Pubkey, owner: Pubkey) -> Result<Box<dyn Rebalancer>> {
+    let account = RpcClient::new(rpc_url.to_string())
+        .get_account(&position)
+        .with_context(|| format!("fetch {position} (closed, or not a mainnet address?)"))?;
+    let (venue, position_owner): (Box<dyn Rebalancer>, Pubkey) = if account.owner
+        == borrowguard_kamino::PROGRAM_ID
+    {
+        let kamino = KaminoVenue::new(rpc_url, position, Some(owner));
+        let position_owner = kamino.owner()?;
+        (Box::new(kamino), position_owner)
+    } else if account.owner == borrowguard_jupiter::VAULTS_PROGRAM_ID {
+        let jupiter = JupiterVenue::new(rpc_url, position, Some(owner));
+        let position_owner = jupiter.owner()?;
+        (Box::new(jupiter), position_owner)
+    } else {
+        anyhow::bail!("{position}: rebalancing works on Kamino and Jupiter Lend positions so far")
+    };
+    ensure!(
+        position_owner == owner,
+        "keypair {owner} doesn't own {position} (owner {position_owner})"
+    );
+    Ok(venue)
+}
+
 fn run_monitor(args: MonitorArgs) -> Result<()> {
     let venue = open_venue(&args.rpc.rpc_url, args.position, args.payer)?;
     let notifier = args.alerts.notifier();
@@ -639,19 +669,7 @@ fn auto_exec(
     live: bool,
 ) -> Result<AutoExec> {
     let owner = solana_sdk::signer::Signer::pubkey(signer);
-    let account = RpcClient::new(rpc_url.to_string()).get_account(&p.address)?;
-    ensure!(
-        account.owner == borrowguard_kamino::PROGRAM_ID,
-        "{}: automatic rebalancing is only implemented for Kamino so far",
-        p.label
-    );
-    let kamino = KaminoVenue::new(rpc_url, p.address, Some(owner));
-    let position_owner = kamino.owner()?;
-    ensure!(
-        position_owner == owner,
-        "{}: keypair {owner} doesn't own this position (owner {position_owner})",
-        p.label
-    );
+    let venue = open_rebalancer(rpc_url, p.address, owner).with_context(|| p.label.clone())?;
     let ctx = ExecContext {
         rpc: ExecContext::rpc(rpc_url),
         signer: solana_sdk::signature::Keypair::from_bytes(&signer.to_bytes())?,
@@ -667,7 +685,7 @@ fn auto_exec(
         send: live,
     };
     Ok(AutoExec::new(
-        Box::new(kamino),
+        venue,
         ctx,
         Duration::from_secs(exec.cooldown_secs),
         exec.max_trades_per_day,
@@ -679,11 +697,9 @@ fn run_rebalance(args: RebalanceArgs) -> Result<()> {
     let signer = load_keypair(&args.keypair)?;
     let owner = solana_sdk::signer::Signer::pubkey(&signer);
     let rpc_url = &args.rpc.rpc_url;
-    let venue = open_venue(rpc_url, args.position, Some(owner))?;
-    ensure!(venue.name() == "kamino", "rebalancing is only implemented for Kamino so far");
-    let kamino = KaminoVenue::new(rpc_url, args.position, Some(owner));
+    let venue = open_rebalancer(rpc_url, args.position, owner)?;
 
-    let snap = kamino.snapshot()?;
+    let snap = venue.snapshot()?;
     let params = args.controller.params(args.band, snap.liquidation_leverage());
     let action = match (args.sell, args.borrow) {
         (Some(sell), _) => Action::Delever { sell, ripcord: false },
@@ -711,15 +727,15 @@ fn run_rebalance(args: RebalanceArgs) -> Result<()> {
     );
     let ctx = args.exec.context(rpc_url, signer);
     let result = match action {
-        Action::Delever { sell, ripcord } => kamino.delever(&ctx, sell, ripcord)?,
-        Action::Relever { borrow } => kamino.relever(&ctx, borrow)?,
+        Action::Delever { sell, ripcord } => venue.delever(&ctx, sell, ripcord)?,
+        Action::Relever { borrow } => venue.relever(&ctx, borrow)?,
         _ => unreachable!("handled above"),
     };
     match result {
         Executed::Simulated { summary, .. } => println!("simulated ok: {summary}"),
         Executed::Sent { signature, summary } => {
             println!("sent: {summary}\nsignature: {signature}");
-            let after = kamino.snapshot()?;
+            let after = venue.snapshot()?;
             let lev = after.position().leverage(after.price()).unwrap_or(f64::INFINITY);
             println!("leverage now {lev:.3}× (was {leverage:.3}×)");
         }
@@ -730,8 +746,8 @@ fn run_rebalance(args: RebalanceArgs) -> Result<()> {
 fn run_lookup_table(args: LookupTableArgs) -> Result<()> {
     let signer = load_keypair(&args.keypair)?;
     let owner = solana_sdk::signer::Signer::pubkey(&signer);
-    let kamino = KaminoVenue::new(&args.rpc.rpc_url, args.position, Some(owner));
-    let addresses = kamino.static_accounts(&owner)?;
+    let venue = open_rebalancer(&args.rpc.rpc_url, args.position, owner)?;
+    let addresses = venue.static_accounts(&owner)?;
     println!("creating a lookup table with {} accounts for {}", addresses.len(), args.position);
     let rpc = ExecContext::rpc(&args.rpc.rpc_url);
     let table =
