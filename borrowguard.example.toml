@@ -31,7 +31,7 @@ ripcord_cost_bps = 100 # same, for ripcord trades
 min_trade = 1.0        # skip routine trades smaller than this (debt token units)
 # max_trade = 5000.0   # cap routine trades (debt token units)
 
-# One block per position. The venue (Kamino or Jupiter Lend) is detected
+# One block per position. The venue (Kamino, Jupiter Lend or marginfi) is detected
 # from the address.
 [[position]]
 address = "2w9MS6MBFr68VpF6dkGwb2ucdKTpNFeXwmS79HSDTxAG"

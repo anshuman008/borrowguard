@@ -491,6 +491,7 @@ dependencies = [
  "borrowguard-exec",
  "borrowguard-jupiter",
  "borrowguard-kamino",
+ "borrowguard-marginfi",
  "chrono",
  "clap",
  "csv",

@@ -12,6 +12,7 @@ use borrowguard_core::{leverage_from_ltv, Action, Params};
 use borrowguard_exec::{jupiter::Jupiter, load_keypair, ExecContext, Execute, Executed};
 use borrowguard_jupiter::JupiterVenue;
 use borrowguard_kamino::{KaminoVenue, Pubkey};
+use borrowguard_marginfi::MarginfiVenue;
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use solana_client::rpc_client::RpcClient;
@@ -33,9 +34,10 @@ enum Cmd {
     FetchPrices(FetchArgs),
     /// Replay the controller over historical candles and compare settings.
     Backtest(BacktestArgs),
-    /// List a wallet's Kamino and Jupiter Lend positions.
+    /// List a wallet's Kamino, Project 0 (marginfi) and Jupiter Lend positions.
     Positions(PositionsArgs),
-    /// Watch a live Kamino or Jupiter Lend position and report what the
+    /// Watch a live Kamino, Project 0 (marginfi) or Jupiter Lend position and
+    /// report what the
     /// controller would do.
     /// Read-only: never sends a transaction.
     Monitor(MonitorArgs),
@@ -185,8 +187,9 @@ struct PositionsArgs {
 
 #[derive(Args)]
 struct MonitorArgs {
-    /// Kamino obligation or Jupiter Lend position to watch (find it with
-    /// `borrowguard positions`). The venue is detected from the account.
+    /// Kamino obligation, marginfi account or Jupiter Lend position to watch
+    /// (find it with `borrowguard positions`). The venue is detected from the
+    /// account.
     #[arg(long, alias = "obligation")]
     position: Pubkey,
     #[command(flatten)]
@@ -419,6 +422,11 @@ fn positions(args: PositionsArgs) -> Result<()> {
         Ok(obligations) => print_kamino(&obligations),
         Err(err) => println!("kamino: lookup failed: {err:#}\n"),
     }
+    let marginfi = borrowguard_marginfi::find_accounts(rpc_url, &args.owner)
+        .and_then(|accounts| print_marginfi(rpc_url, &accounts));
+    if let Err(err) = marginfi {
+        println!("marginfi: lookup failed: {err:#}\n");
+    }
     match borrowguard_jupiter::find_positions(rpc_url, &args.owner) {
         Ok(positions) => print_jupiter(&positions),
         Err(err) => println!("jupiter: lookup failed: {err:#}"),
@@ -461,6 +469,59 @@ fn print_kamino(obligations: &[(Pubkey, borrowguard_kamino::layout::Obligation)]
     println!();
 }
 
+fn print_marginfi(
+    rpc_url: &str,
+    accounts: &[(Pubkey, borrowguard_marginfi::layout::MarginfiAccount)],
+) -> Result<()> {
+    if accounts.is_empty() {
+        println!("marginfi: no accounts\n");
+        return Ok(());
+    }
+    let mut keys: Vec<Pubkey> =
+        accounts.iter().flat_map(|(_, a)| a.balances.iter().map(|b| b.bank)).collect();
+    keys.sort();
+    keys.dedup();
+    let banks: std::collections::HashMap<_, _> =
+        borrowguard_marginfi::fetch_banks(rpc_url, &keys)?.into_iter().collect();
+    let symbol = |bank: &Pubkey| {
+        banks
+            .get(bank)
+            .map_or("?".to_string(), |b| borrowguard_core::token::symbol(&b.mint.to_string()))
+    };
+    println!("marginfi / Project 0 (liq LTV from bank weights; `monitor` shows live values)");
+    println!(
+        "  {:<45} {:>5} {:>5} {:<18} {:>8}  guardable",
+        "position", "coll", "debt", "pair", "liq LTV"
+    );
+    for (key, a) in accounts {
+        let deposits: Vec<_> = a.deposits().collect();
+        let borrows: Vec<_> = a.borrows().collect();
+        let (pair, liq) = match (deposits.as_slice(), borrows.as_slice()) {
+            ([d], [b]) => {
+                let liq = match (banks.get(&d.bank), banks.get(&b.bank)) {
+                    (Some(c), Some(l)) => {
+                        format!("{:.1}%", c.asset_weight_maint / l.liability_weight_maint * 100.0)
+                    }
+                    _ => "-".into(),
+                };
+                (format!("{}/{}", symbol(&d.bank), symbol(&b.bank)), liq)
+            }
+            _ => ("-".into(), "-".into()),
+        };
+        println!(
+            "  {:<45} {:>5} {:>5} {:<18} {:>8}  {}",
+            key.to_string(),
+            deposits.len(),
+            borrows.len(),
+            pair,
+            liq,
+            if deposits.len() == 1 && borrows.len() == 1 { "yes" } else { "no" },
+        );
+    }
+    println!();
+    Ok(())
+}
+
 fn print_jupiter(positions: &[borrowguard_jupiter::FoundPosition]) {
     if positions.is_empty() {
         println!("jupiter: no positions");
@@ -494,8 +555,13 @@ fn open_venue(rpc_url: &str, position: Pubkey, payer: Option<Pubkey>) -> Result<
         Ok(Box::new(KaminoVenue::new(rpc_url, position, payer)))
     } else if account.owner == borrowguard_jupiter::VAULTS_PROGRAM_ID {
         Ok(Box::new(JupiterVenue::new(rpc_url, position, payer)))
+    } else if account.owner == borrowguard_marginfi::PROGRAM_ID {
+        Ok(Box::new(MarginfiVenue::new(rpc_url, position, payer)))
     } else {
-        anyhow::bail!("{position} is owned by {}, not Kamino Lend or Jupiter Lend", account.owner)
+        anyhow::bail!(
+            "{position} is owned by {}, not Kamino Lend, Jupiter Lend or marginfi",
+            account.owner
+        )
     }
 }
 
