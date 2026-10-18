@@ -541,6 +541,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "borrowguard-core",
+ "borrowguard-exec",
  "bytemuck",
  "solana-account-decoder",
  "solana-client",

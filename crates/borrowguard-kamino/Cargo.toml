@@ -7,7 +7,8 @@ rust-version.workspace = true
 license.workspace      = true
 
 [dependencies]
-borrowguard-core          = { workspace = true }
+borrowguard-core       = { workspace = true }
+borrowguard-exec       = { workspace = true }
 anyhow                 = { workspace = true }
 thiserror              = { workspace = true }
 bytemuck               = { workspace = true }

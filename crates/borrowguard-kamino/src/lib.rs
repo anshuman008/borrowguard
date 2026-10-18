@@ -5,6 +5,7 @@
 //! oracle reads, interest accrual and elevation-group / borrow-factor math, so
 //! BorrowGuard sees exactly the numbers klend would liquidate on.
 
+pub mod exec;
 pub mod ix;
 pub mod layout;
 pub mod reserve;
@@ -154,7 +155,9 @@ pub fn snapshot_from(
 }
 
 /// BorrowGuard handles exactly one collateral and one debt per obligation.
-fn single_pair(obligation: &Obligation) -> Result<(&ObligationCollateral, &ObligationLiquidity)> {
+pub(crate) fn single_pair(
+    obligation: &Obligation,
+) -> Result<(&ObligationCollateral, &ObligationLiquidity)> {
     let deposits: Vec<_> = obligation.active_deposits().collect();
     let borrows: Vec<_> = obligation.active_borrows().collect();
     match (deposits.as_slice(), borrows.as_slice()) {
