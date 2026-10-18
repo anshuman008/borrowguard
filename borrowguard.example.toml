@@ -7,6 +7,17 @@
 # Seconds between checks.
 interval_secs = 10
 
+# Automatic rebalancing (Kamino only so far). Positions opt in with
+# `execute = true`, and nothing is sent unless `watch` runs with --live.
+# [execution]
+# keypair = "~/.config/solana/borrowguard.json"  # owner of the positions; keep outside the repo
+# slippage_bps = 50            # max swap slippage, routine trades
+# ripcord_slippage_bps = 150   # max swap slippage, ripcord trades
+# priority_fee = 50000         # micro-lamports per compute unit
+# cooldown_secs = 120          # min time between trades on one position (ripcord: 20s)
+# max_trades_per_day = 24      # per position
+# kill_switch = "STOP"         # while this file exists, nothing is traded
+
 # Applies to every position unless the position sets its own value.
 [defaults]
 # Fee payer for read-only simulations: any wallet with a little SOL, normally
@@ -25,6 +36,8 @@ min_trade = 1.0        # skip routine trades smaller than this (debt token units
 [[position]]
 address = "2w9MS6MBFr68VpF6dkGwb2ucdKTpNFeXwmS79HSDTxAG"
 label = "kamino jitosol loop"
+# execute = true                    # rebalance automatically (needs [execution])
+# lookup_table = "<FROM borrowguard lookup-table>"
 target = 12.0
 band = 0.4
 ripcord = 15.0
