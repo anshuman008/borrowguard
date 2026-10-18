@@ -1,0 +1,15 @@
+[package]
+name         = "borrowguard-marginfi"
+description  = "Project 0 (marginfi v2) venue for BorrowGuard"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+
+[dependencies]
+borrowguard-core       = { workspace = true }
+anyhow                 = { workspace = true }
+solana-program         = { workspace = true }
+solana-sdk             = { workspace = true }
+solana-client          = { workspace = true }
+solana-account-decoder = { workspace = true }

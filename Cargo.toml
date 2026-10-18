@@ -5,6 +5,7 @@ members = [
     "crates/borrowguard-exec",
     "crates/borrowguard-kamino",
     "crates/borrowguard-jupiter",
+    "crates/borrowguard-marginfi",
     "crates/borrowguard-cli",
 ]
 
@@ -19,6 +20,7 @@ borrowguard-core   = { path = "crates/borrowguard-core" }
 borrowguard-exec   = { path = "crates/borrowguard-exec" }
 borrowguard-kamino = { path = "crates/borrowguard-kamino" }
 borrowguard-jupiter = { path = "crates/borrowguard-jupiter" }
+borrowguard-marginfi = { path = "crates/borrowguard-marginfi" }
 
 anyhow     = "1"
 thiserror  = "2"

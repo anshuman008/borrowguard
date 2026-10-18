@@ -553,6 +553,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "borrowguard-marginfi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "borrowguard-core",
+ "solana-account-decoder",
+ "solana-client",
+ "solana-program",
+ "solana-sdk",
+]
+
+[[package]]
 name = "borsh"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
