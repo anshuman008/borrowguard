@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""End-to-end delever test on a Surfpool mainnet fork. Fake money only.
+"""End-to-end rebalance test on a Surfpool mainnet fork. Fake money only.
 
 Start the fork first (in another terminal):
     surfpool start -u "$RPC_URL" --no-tui --no-deploy
 
 Then, from the repo root:
     cargo build --release
-    python3 scripts/fork_delever_test.py <KAMINO_OBLIGATION> [--target 1.4]
+    python3 scripts/fork_delever_test.py <KAMINO_OBLIGATION> [--up 2.2] [--target 1.4]
 
 It copies the mainnet obligation into the fork, hands it to a throwaway
 keypair, funds that keypair, creates its token accounts and lookup table,
-refreshes oracle prices (the fork's copies go stale), then delevers with
---send and checks that leverage moved to the target.
+refreshes oracle prices (the fork's copies go stale), then relevers up to
+--up and delevers down to --target with --send, checking each lands.
 """
 import argparse, base64, json, os, re, subprocess, sys, tempfile, urllib.request
 
@@ -69,7 +69,8 @@ def run(*args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("obligation")
-    ap.add_argument("--target", default="1.4")
+    ap.add_argument("--up", default="2.2", help="relever to this leverage first")
+    ap.add_argument("--target", default="1.4", help="then delever to this leverage")
     args = ap.parse_args()
     mainnet = os.environ.get("RPC_URL") or sys.exit("set RPC_URL to a mainnet RPC")
 
@@ -104,23 +105,30 @@ def main():
             k = r[TOKEN_INFO + off:TOKEN_INFO + off + 32]
             if k != b"\0" * 32:
                 oracles.add(b58encode(k))
-    for k in oracles:
-        v = account(mainnet, k)
-        if v:
-            set_account(k, base64.b64decode(v["data"][0]), v["lamports"], v["owner"], v["executable"])
 
-    # Proprietary market makers (e.g. Kipseli, HumidiFi) price from off-chain
-    # updates that a frozen fork doesn't get; stick to classic pools here.
-    out = run(BIN, "delever", *common, "--target", args.target, "--band", "0.1",
-              "--ripcord", "2.5", "--lookup-table", alt, "--send",
-              "--jupiter-dexes", "Whirlpool,Raydium CLMM,Meteora DLMM")
-    m = re.search(r"leverage now ([\d.]+)× \(was ([\d.]+)×\)", out)
-    if not m:
-        sys.exit("no leverage line in output")
-    after, before = float(m.group(1)), float(m.group(2))
-    target = float(args.target)
-    ok = abs(after - target) < 0.05 and after < before
-    print(f"{'PASS' if ok else 'FAIL'}: leverage {before:.3f}× → {after:.3f}× (target {target}×)")
+    def refresh_oracles():
+        for k in oracles:
+            v = account(mainnet, k)
+            if v:
+                set_account(k, base64.b64decode(v["data"][0]), v["lamports"], v["owner"],
+                            v["executable"])
+
+    ok = True
+    for target, direction in ((args.up, "up"), (args.target, "down")):
+        refresh_oracles()
+        # Proprietary market makers (e.g. Kipseli, HumidiFi) price from off-chain
+        # updates that a frozen fork doesn't get; stick to classic pools here.
+        out = run(BIN, "rebalance", *common, "--target", target, "--band", "0.1",
+                  "--ripcord", "4.0", "--lookup-table", alt, "--send",
+                  "--jupiter-dexes", "Whirlpool,Raydium CLMM,Meteora DLMM")
+        m = re.search(r"leverage now ([\d.]+)× \(was ([\d.]+)×\)", out)
+        if not m:
+            sys.exit("no leverage line in output")
+        after, before = float(m.group(1)), float(m.group(2))
+        moved = after > before if direction == "up" else after < before
+        good = moved and abs(after - float(target)) < 0.05
+        ok &= good
+        print(f"{'PASS' if good else 'FAIL'} {direction}: leverage {before:.3f}× → {after:.3f}× (target {target}×)")
     sys.exit(0 if ok else 1)
 
 
