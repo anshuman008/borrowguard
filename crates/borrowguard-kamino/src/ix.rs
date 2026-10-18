@@ -265,6 +265,89 @@ pub fn withdraw_v2(
     }
 }
 
+/// `deposit_reserve_liquidity_and_obligation_collateral_v2`: owner deposits
+/// `amount` of liquidity from `user_source` as collateral.
+pub fn deposit_v2(
+    program_id: &Pubkey,
+    owner: &Pubkey,
+    obligation: &Pubkey,
+    reserve_key: &Pubkey,
+    reserve: &Reserve,
+    user_source: &Pubkey,
+    amount: u64,
+) -> Instruction {
+    let [farm_user, farm_state] = farm_accounts(program_id, reserve.farm_collateral, obligation);
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*owner, true),
+            AccountMeta::new(*obligation, false),
+            AccountMeta::new_readonly(reserve.lending_market, false),
+            AccountMeta::new_readonly(
+                lending_market_authority(program_id, &reserve.lending_market),
+                false,
+            ),
+            AccountMeta::new(*reserve_key, false),
+            AccountMeta::new_readonly(reserve.mint, false),
+            AccountMeta::new(reserve.supply_vault, false),
+            AccountMeta::new(reserve.collateral_mint, false),
+            AccountMeta::new(reserve.collateral_supply_vault, false),
+            AccountMeta::new(*user_source, false),
+            AccountMeta::new_readonly(*program_id, false), // placeholder user destination collateral
+            AccountMeta::new_readonly(spl_token_program(), false), // collateral (cToken) program
+            AccountMeta::new_readonly(reserve.token_program, false),
+            AccountMeta::new_readonly(sysvar::instructions::ID, false),
+            farm_user,
+            farm_state,
+            AccountMeta::new_readonly(FARMS_PROGRAM_ID, false),
+        ],
+        data: with_amount("deposit_reserve_liquidity_and_obligation_collateral_v2", amount),
+    }
+}
+
+/// `borrow_obligation_liquidity_v2`: owner borrows exactly `amount` into
+/// `user_destination` (the borrow fee is added to the debt, not deducted).
+/// Obligations in an elevation group must also pass their deposit reserves.
+#[allow(clippy::too_many_arguments)]
+pub fn borrow_v2(
+    program_id: &Pubkey,
+    owner: &Pubkey,
+    obligation: &Pubkey,
+    reserve_key: &Pubkey,
+    reserve: &Reserve,
+    user_destination: &Pubkey,
+    amount: u64,
+    elevation_group_deposits: &[Pubkey],
+) -> Instruction {
+    let [farm_user, farm_state] = farm_accounts(program_id, reserve.farm_debt, obligation);
+    let mut accounts = vec![
+        AccountMeta::new_readonly(*owner, true),
+        AccountMeta::new(*obligation, false),
+        AccountMeta::new_readonly(reserve.lending_market, false),
+        AccountMeta::new_readonly(
+            lending_market_authority(program_id, &reserve.lending_market),
+            false,
+        ),
+        AccountMeta::new(*reserve_key, false),
+        AccountMeta::new_readonly(reserve.mint, false),
+        AccountMeta::new(reserve.supply_vault, false),
+        AccountMeta::new(reserve.fee_vault, false),
+        AccountMeta::new(*user_destination, false),
+        AccountMeta::new_readonly(*program_id, false), // referrer token state (none)
+        AccountMeta::new_readonly(reserve.token_program, false),
+        AccountMeta::new_readonly(sysvar::instructions::ID, false),
+        farm_user,
+        farm_state,
+        AccountMeta::new_readonly(FARMS_PROGRAM_ID, false),
+    ];
+    accounts.extend(elevation_group_deposits.iter().map(|r| AccountMeta::new(*r, false)));
+    Instruction {
+        program_id: *program_id,
+        accounts,
+        data: with_amount("borrow_obligation_liquidity_v2", amount),
+    }
+}
+
 /// Reserve collateral mints are always classic SPL Token.
 fn spl_token_program() -> Pubkey {
     pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
