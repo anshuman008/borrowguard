@@ -123,6 +123,20 @@ impl Venue for MarginfiVenue {
         let (account, banks, slot) = self.pulse(&account)?;
         snapshot_from(&account, &banks, slot)
     }
+
+    fn watch_accounts(&self) -> Result<Vec<[u8; 32]>> {
+        let account = self.account()?;
+        let keys: Vec<Pubkey> = account.balances.iter().map(|b| b.bank).collect();
+        let mut out = vec![self.account];
+        for (key, bank) in keys.iter().zip(self.rpc.get_multiple_accounts(&keys)?) {
+            out.extend(observation_keys(&parse_bank(
+                &bank.with_context(|| format!("bank {key} not found"))?.data,
+            )?)?);
+        }
+        out.sort();
+        out.dedup();
+        Ok(out.into_iter().map(Pubkey::to_bytes).collect())
+    }
 }
 
 /// Build a snapshot from a freshly pulsed account and its banks, in balance order.

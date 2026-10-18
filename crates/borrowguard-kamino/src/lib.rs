@@ -120,6 +120,25 @@ impl Venue for KaminoVenue {
         let debt = parse_reserve(&next()?)?;
         snapshot_from(&obligation, &collateral, &debt, sim.context.slot)
     }
+
+    fn watch_accounts(&self) -> Result<Vec<[u8; 32]>> {
+        let obligation = parse_obligation(&self.rpc.get_account_data(&self.obligation)?)?;
+        let (deposit, borrow) = single_pair(&obligation)?;
+        let keys = [deposit.deposit_reserve, borrow.borrow_reserve];
+        let mut out = vec![self.obligation];
+        for (key, account) in keys.iter().zip(self.rpc.get_multiple_accounts(&keys)?) {
+            let r =
+                parse_reserve(&account.with_context(|| format!("reserve {key} not found"))?.data)?;
+            out.extend(
+                [r.pyth_price, r.switchboard_price, r.switchboard_twap, r.scope_prices]
+                    .into_iter()
+                    .flatten(),
+            );
+        }
+        out.sort();
+        out.dedup();
+        Ok(out.into_iter().map(Pubkey::to_bytes).collect())
+    }
 }
 
 /// Build a snapshot from a freshly refreshed obligation and its two reserves.

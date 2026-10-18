@@ -117,6 +117,14 @@ impl Venue for JupiterVenue {
         let r = self.read()?;
         snapshot_from(&r.pos, &r.config, r.supply_ex, r.borrow_ex, r.rate, r.slot)
     }
+
+    fn watch_accounts(&self) -> Result<Vec<[u8; 32]>> {
+        let pos = parse_position(&self.rpc.get_account_data(&self.position)?)?;
+        let config =
+            parse_vault_config(&self.rpc.get_account_data(&vault_config_pda(pos.vault_id))?)?;
+        let oracle = parse_oracle(&self.rpc.get_account_data(&config.oracle)?)?;
+        Ok(std::iter::once(self.position).chain(oracle.sources).map(|k| k.to_bytes()).collect())
+    }
 }
 
 impl JupiterVenue {

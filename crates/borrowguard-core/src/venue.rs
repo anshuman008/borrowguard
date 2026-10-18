@@ -49,6 +49,13 @@ pub trait Venue {
 
     /// Fresh snapshot of the guarded position.
     fn snapshot(&self) -> anyhow::Result<Snapshot>;
+
+    /// Accounts whose changes can move the position's health: the position
+    /// itself and its price feeds. A streaming watcher re-checks the position
+    /// when any of them changes. Empty means "poll only".
+    fn watch_accounts(&self) -> anyhow::Result<Vec<[u8; 32]>> {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]
