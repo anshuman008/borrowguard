@@ -6,13 +6,14 @@ never drift into liquidation.
 
 You pick a target leverage, a no-trade band around it and an emergency
 "ripcord" level. When leverage leaves the band, BorrowGuard alerts you and (on
-Kamino, so far) rebalances the position with a flash loan, in one transaction,
-from your own wallet.
+Kamino and Jupiter Lend) rebalances the position with a flash loan, in one
+transaction, from your own wallet.
 
 > **Status: early.** The controller core, backtester and live monitor (Kamino,
-> Jupiter Lend, Project 0 / marginfi) work. Kamino **rebalancing in both directions** (delever and
-> relever) works, by hand or automatically from `watch --live`, and is tested
-> on a mainnet fork. It has not been run with real money yet.
+> Jupiter Lend, Project 0 / marginfi) work. **Rebalancing in both directions**
+> (delever and relever) works on Kamino and Jupiter Lend, by hand or
+> automatically from `watch --live`, and is tested on a mainnet fork. It has
+> not been run with real money yet.
 
 ## How it works
 
@@ -37,7 +38,7 @@ falls and borrows more as it rises, which keeps leverage at the target.
 Trade sizes account for execution cost, so the position lands exactly on target
 after paying slippage and fees (see `borrowguard-core/src/controller.rs`).
 
-The planned delever is one atomic transaction:
+Each delever is one atomic transaction (Kamino shown):
 
 ```
 refresh reserves + obligation → flash-borrow USDC → repay debt
@@ -50,7 +51,7 @@ refresh reserves + obligation → flash-borrow USDC → repay debt
 |---|---|
 | `crates/borrowguard-core` | Position math, the controller and the `Venue` trait. No Solana deps; shared by backtester and bot. |
 | `crates/borrowguard-kamino` | Kamino Lend venue: klend account layouts, instruction builders, live snapshots, delever execution. |
-| `crates/borrowguard-jupiter` | Jupiter Lend venue: Fluid vault layouts, exact tick math, live snapshots. |
+| `crates/borrowguard-jupiter` | Jupiter Lend venue: Fluid vault layouts, exact tick math, live snapshots, `operate` / flash-loan builders, delever and relever execution. |
 | `crates/borrowguard-marginfi` | Project 0 (marginfi v2) venue: account and bank layouts, live snapshots from the risk engine's health cache. |
 | `crates/borrowguard-exec` | Execution plumbing shared by venues: Jupiter swaps, lookup tables, compose / simulate / send. |
 | `crates/borrowguard-cli` | The `borrowguard` binary: `fetch-prices`, `backtest`, `positions`, `monitor`, `watch`, `lookup-table`, `rebalance`. |
@@ -60,7 +61,7 @@ refresh reserves + obligation → flash-borrow USDC → repay debt
 | Venue | Status |
 |---|---|
 | Kamino Lend | ✅ monitor · ✅ delever + relever, manual or automatic (fork-tested) |
-| Jupiter Lend | ✅ monitor |
+| Jupiter Lend | ✅ monitor · ✅ delever + relever, manual or automatic (fork-tested) |
 | Project 0 / marginfi | ✅ monitor |
 | Save | planned |
 
@@ -225,9 +226,10 @@ for details.
 - Trades fill at the bar close with a fixed cost in bps. The live bot will use
   real swap quotes.
 
-## Rebalance a Kamino position
+## Rebalance a position
 
-Each rebalance is one atomic transaction, funded by a Kamino flash loan:
+Each rebalance is one atomic transaction, funded by a flash loan from the same
+protocol. On Kamino:
 
 ```
 delever:  flash-borrow USDC → refresh → repay debt → refresh → withdraw SOL
@@ -236,25 +238,41 @@ relever:  flash-borrow USDC → Jupiter swap USDC → SOL → refresh → deposi
           → refresh → borrow USDC → flash-repay
 ```
 
+On Jupiter Lend, one `operate` call changes collateral and debt together:
+
+```
+delever:  flash-borrow USDC → operate(withdraw SOL, pay back USDC)
+          → Jupiter swap SOL → USDC → flash payback
+relever:  flash-borrow USDC → Jupiter swap USDC → SOL
+          → operate(deposit SOL, borrow USDC) → flash payback
+```
+
+`operate` must be handed the tick the position will land in, so BorrowGuard
+predicts it with a port of the vault's own integer math (it reproduces the
+stored tick of every live position it was checked against), and creates any
+tick or branch account the move needs first.
+
 Amounts follow the swap's **guaranteed** output (Jupiter's slippage floor): a
 delever repays only what that output covers net of the flash fee, a relever
 deposits only what it guarantees and borrows back exactly the flash loan plus
-its fee. Any extra stays in your wallet. Every transaction is simulated first.
+its fee. Any extra stays in your wallet, so a delever lands slightly above
+target, more so at high leverage. Every transaction is simulated first.
 
 ```bash
 # One-time per position: a lookup table with its accounts (~0.004 SOL rent).
 # Without it, the swap route doesn't fit in one transaction.
-./target/release/borrowguard lookup-table --position <OBLIGATION> --keypair ~/.config/solana/borrowguard.json
+./target/release/borrowguard lookup-table --position <POSITION> --keypair ~/.config/solana/borrowguard.json
 
 # Simulate what the controller would do (nothing is sent)
-./target/release/borrowguard rebalance --position <OBLIGATION> --keypair ~/.config/solana/borrowguard.json \
+./target/release/borrowguard rebalance --position <POSITION> --keypair ~/.config/solana/borrowguard.json \
     --lookup-table <TABLE> --target 3
 
 # Do it (--sell / --borrow force a direction and size)
 ./target/release/borrowguard rebalance ... --send
 ```
 
-The keypair must be the obligation's owner. Keep it in a file outside the repo
+The keypair must own the position (Kamino: the obligation's owner; Jupiter
+Lend: the wallet holding the position NFT). Keep it in a file outside the repo
 (it can also come from `BORROWGUARD_KEYPAIR` in `.env`).
 
 ### Automatic rebalancing from `watch`
@@ -269,7 +287,7 @@ cooldown_secs = 120
 max_trades_per_day = 24
 
 [[position]]
-address = "<OBLIGATION>"
+address = "<POSITION>"
 target = 3.0
 execute = true
 lookup_table = "<TABLE>"
@@ -296,19 +314,34 @@ controller  target 1.4× band ±0.1 ripcord 2.5× (AUTO-REBALANCE LIVE: trades a
 ### Test on a mainnet fork first
 
 [Surfpool](https://github.com/txtx/surfpool) runs a local copy of mainnet with
-fake money. The test script copies a real obligation into it, hands it to a
-throwaway keypair, relevers it up and delevers it back down:
+fake money. The test script takes a real Kamino obligation or Jupiter Lend
+position, hands it to a throwaway keypair inside the fork, relevers it up and
+delevers it back down:
 
 ```bash
 surfpool start -u "$RPC_URL" --no-tui --no-deploy        # another terminal
-RPC_URL=... python3 scripts/fork_delever_test.py <KAMINO_OBLIGATION> --up 2.2 --target 1.4
+RPC_URL=... python3 scripts/fork_delever_test.py <POSITION> --up 2.2 --target 1.4
 ```
+
+Run it soon after starting the fork: Surfpool makes slots slower than mainnet,
+and the script refuses a fork that has drifted far behind.
+
+Kamino SOL/USDC:
 
 ```
 sent: borrow 13.9274 USDC → ≥0.135688 SOL (quote 0.136370, impact 0.020%), deposit 0.135688 SOL, 431654 CU
 PASS up: leverage 1.767× → 2.201× (target 2.2×)
 sent: sell 0.253874 SOL → ≥25.7919 USDC (quote 25.9215, impact 0.029%), repay 25.7916 USDC, 426437 CU
 PASS down: leverage 2.201× → 1.403× (target 1.4×)
+```
+
+Jupiter Lend SOL/USDC (also passes on cbBTC/USDC and the JitoSOL/SOL loop):
+
+```
+sent: borrow 312.8846 USDC → ≥3.086737 SOL (quote 3.102248, impact 0.037%), deposit 3.086737 SOL, 335029 CU
+PASS up: leverage 2.002× → 2.502× (target 2.5×)
+sent: sell 5.662911 SOL → ≥568.0523 USDC (quote 570.9068, impact 0.008%), repay 568.0523 USDC, 323996 CU
+PASS down: leverage 2.502× → 1.603× (target 1.6×)
 ```
 
 On the fork the script routes swaps through classic pools only
@@ -325,8 +358,10 @@ frozen fork doesn't receive.
 6. ✅ Executor for Kamino: flash-loan delever and relever, manual
    (`rebalance`) or automatic (`watch --live`), tested on a
    [Surfpool](https://github.com/txtx/surfpool) mainnet fork
-7. ⬜ Mainnet with a small position; dry-run by default
-8. ⬜ Stretch: liquidator mode (same building blocks, other people's positions)
+7. ✅ Executor for Jupiter Lend: the same, fork-tested on SOL/USDC,
+   cbBTC/USDC and JitoSOL/SOL vaults
+8. ⬜ Mainnet with a small position; dry-run by default
+9. ⬜ Stretch: liquidator mode (same building blocks, other people's positions)
 
 ## Safety
 
