@@ -40,3 +40,29 @@ fn snapshot_from_real_accounts() {
     let leverage = snap.position().leverage(snap.price()).unwrap();
     assert!(leverage > 1.0 && leverage < snap.liquidation_leverage(), "leverage {leverage}");
 }
+
+#[test]
+fn reserve_execution_fields_are_sane() {
+    for data in [COLLATERAL, DEBT] {
+        let r = parse_reserve(data).unwrap();
+        // SPL Token or Token-2022; the executor must use whichever the reserve says.
+        let program = r.token_program.to_string();
+        assert!(
+            [
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+            ]
+            .contains(&program.as_str()),
+            "{} token program {program}",
+            r.name
+        );
+        for key in [r.supply_vault, r.fee_vault, r.collateral_mint, r.collateral_supply_vault] {
+            assert_ne!(key, Default::default());
+        }
+        // Each cToken is worth slightly more than one unit of liquidity as
+        // interest accrues; it never drops below 1.
+        let rate = r.total_liquidity as f64 / r.collateral_mint_supply as f64;
+        assert!((1.0..2.0).contains(&rate), "{} rate {rate}", r.name);
+        assert!((0.0..0.01).contains(&r.flash_loan_fee), "{} fee {}", r.name, r.flash_loan_fee);
+    }
+}
