@@ -133,6 +133,39 @@ the position's NFT holder, a lookup the public RPC throttles, so pass
 Alerts go to Telegram and/or Discord whenever the verdict changes (for example
 hold → delever, or an RPC error).
 
+### Watch all your positions at once
+
+List them in `borrowguard.toml` (gitignored), with shared defaults and
+per-position overrides:
+
+```bash
+cp borrowguard.example.toml borrowguard.toml   # then edit addresses and settings
+./target/release/borrowguard watch             # add --once for a single round
+```
+
+```toml
+interval_secs = 10
+
+[defaults]
+payer = "<YOUR_WALLET>"
+target = 3.0
+
+[[position]]
+address = "<KAMINO_OBLIGATION>"
+label = "kamino jitosol loop"
+target = 12.0
+band = 0.4
+ripcord = 15.0
+
+[[position]]
+address = "<JUPITER_POSITION>"
+label = "jupiter sol/usdc"
+```
+
+Unknown keys are rejected, so a typo like `traget` fails loudly instead of
+silently falling back to a default. Each line of output and each alert is
+prefixed with the position's label.
+
 ### Example: SOL, Oct 2025 → Oct 2026, 5-minute bars, 3× target
 
 ```
@@ -179,10 +212,11 @@ for details.
 1. ✅ Controller core and backtester
 2. ✅ Read-only monitor for Kamino: live leverage, trigger prices, alerts
 3. ✅ Jupiter Lend venue (monitor)
-4. ⬜ Executor: flash-loan delever/relever transactions, tested on a
+4. ✅ Watch many positions from one config file
+5. ⬜ Executor: flash-loan delever/relever transactions, tested on a
    [Surfpool](https://github.com/txtx/surfpool) mainnet fork
-5. ⬜ Mainnet with a small position; dry-run by default
-6. ⬜ Stretch: liquidator mode (same building blocks, other people's positions)
+6. ⬜ Mainnet with a small position; dry-run by default
+7. ⬜ Stretch: liquidator mode (same building blocks, other people's positions)
 
 ## Safety
 
