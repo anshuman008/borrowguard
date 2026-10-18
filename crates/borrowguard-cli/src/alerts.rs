@@ -20,7 +20,13 @@ impl Notifier {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("static reqwest config");
-        Self { client, telegram: telegram_token.zip(telegram_chat), discord: discord_webhook }
+        // Blank values (e.g. `DISCORD_WEBHOOK_URL=` from .env.example) mean "off".
+        let set = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+        Self {
+            client,
+            telegram: set(telegram_token).zip(set(telegram_chat)),
+            discord: set(discord_webhook),
+        }
     }
 
     pub fn channels(&self) -> Vec<&'static str> {
@@ -46,5 +52,19 @@ impl Notifier {
             // reqwest errors can echo the URL, which holds the bot token / webhook secret.
             eprintln!("alert to {channel} failed: {}", err.without_url());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_credentials_disable_channels() {
+        let blank = || Some(String::new());
+        assert!(Notifier::new(blank(), blank(), blank()).channels().is_empty());
+        let on = Notifier::new(Some("t".into()), Some("1".into()), Some("https://x".into()));
+        assert_eq!(on.channels(), vec!["telegram", "discord"]);
+        assert!(Notifier::new(Some("t".into()), None, None).channels().is_empty());
     }
 }
