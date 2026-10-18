@@ -42,3 +42,13 @@ solana-program         = "=2.1.20"
 solana-sdk             = { version = "=2.1.20", default-features = false }
 solana-client          = "=2.1.20"
 solana-account-decoder = "=2.1.20"
+
+# Streaming account updates (`watch --stream`).
+tokio        = { version = "1", features = ["rt", "time", "sync", "macros"] }
+futures-util = "0.3"
+# gRPC (Yellowstone / Helius LaserStream / Triton), behind the CLI's `grpc`
+# feature. The proto crate's default compression features are left off: with
+# them, tonic subscriptions are known to connect but never deliver data.
+tokio-stream           = "0.1"
+tonic                  = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
+yellowstone-grpc-proto = { version = "=12.1.0", default-features = false, features = ["tonic"] }

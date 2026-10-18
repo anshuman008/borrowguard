@@ -4,8 +4,9 @@
 //! transactions when their `ExecContext` says so (`watch --live`).
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
+    sync::mpsc::{Receiver, RecvTimeoutError},
     thread,
     time::{Duration, Instant},
 };
@@ -14,12 +15,22 @@ use anyhow::{bail, Context, Result};
 use borrowguard_core::{Action, Params, Snapshot, Venue};
 use borrowguard_exec::{ExecContext, Execute, Executed};
 use chrono::Utc;
+use solana_sdk::pubkey::Pubkey;
 
 use crate::alerts::Notifier;
 
 pub struct Settings {
+    /// Every position is checked (and printed) at least this often.
     pub interval: Duration,
     pub once: bool,
+    /// Least time between two stream-triggered checks of one position.
+    pub min_check: Duration,
+}
+
+/// Account-change notifications, and the positions each account affects.
+pub struct Feed {
+    pub changes: Receiver<Pubkey>,
+    pub positions: HashMap<Pubkey, Vec<usize>>,
 }
 
 /// Controller settings for one position. The venue supplies the liquidation
@@ -68,11 +79,26 @@ pub struct Watched {
     pub auto: Option<AutoExec>,
     last_status: &'static str,
     header_shown: bool,
+    last_check: Option<Instant>,
+    /// A watched account changed since the last check.
+    dirty: bool,
+    /// Stream-triggered checks since the last heartbeat.
+    rechecks: usize,
 }
 
 impl Watched {
     pub fn new(label: String, venue: Box<dyn Venue>, controller: Controller) -> Self {
-        Self { label, venue, controller, auto: None, last_status: "", header_shown: false }
+        Self {
+            label,
+            venue,
+            controller,
+            auto: None,
+            last_status: "",
+            header_shown: false,
+            last_check: None,
+            dirty: false,
+            rechecks: 0,
+        }
     }
 
     pub fn with_auto(mut self, auto: AutoExec) -> Self {
@@ -150,7 +176,7 @@ impl AutoExec {
 
     /// Carry out the controller's action if the gates allow. Returns a line
     /// to print and whether it deserves an alert.
-    fn act(&mut self, action: Action) -> Option<(String, bool)> {
+    fn act(&mut self, action: Action) -> Option<Outcome> {
         let ripcord = matches!(action, Action::Delever { ripcord: true, .. });
         if matches!(action, Action::Hold | Action::Insolvent) {
             return None;
@@ -161,12 +187,12 @@ impl AutoExec {
             Gate::Cooldown => return None,
             Gate::KillSwitch => {
                 let msg = format!("trading paused: {} exists", self.kill_switch.display());
-                return Some((msg, false));
+                return Some(Outcome { msg, alert: false, blocked: true });
             }
             Gate::DailyCap => {
                 let msg =
                     format!("daily cap of {} trades reached; not trading", self.max_trades_per_day);
-                return Some((msg, false));
+                return Some(Outcome { msg, alert: false, blocked: true });
             }
         }
         self.last_attempt = Some(now);
@@ -175,7 +201,7 @@ impl AutoExec {
             Action::Relever { borrow } => self.executor.relever(&self.ctx, borrow),
             Action::Hold | Action::Insolvent => unreachable!("filtered above"),
         };
-        Some(match result {
+        let (msg, alert) = match result {
             Ok(Executed::Sent { signature, summary }) => {
                 self.sent.push_back(Instant::now());
                 while self.sent.front().is_some_and(|t| now.duration_since(*t) >= DAY) {
@@ -187,8 +213,18 @@ impl AutoExec {
                 (format!("would trade (simulated, not sent): {summary}"), false)
             }
             Err(err) => (format!("trade FAILED: {err:#}"), true),
-        })
+        };
+        Some(Outcome { msg, alert, blocked: false })
     }
+}
+
+/// What an automatic rebalance attempt did.
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    msg: String,
+    alert: bool,
+    /// Held back by the kill switch or the daily cap.
+    blocked: bool,
 }
 
 /// What one check concluded.
@@ -198,55 +234,117 @@ struct Verdict {
     action: Action,
 }
 
-pub fn run(watched: &mut [Watched], notifier: &Notifier, settings: Settings) -> Result<()> {
+pub fn run(
+    watched: &mut [Watched],
+    notifier: &Notifier,
+    settings: Settings,
+    mut feed: Option<Feed>,
+) -> Result<()> {
     let multi = watched.len() > 1;
-    loop {
-        let mut failed = 0;
-        for w in watched.iter_mut() {
-            let prefix = if multi { format!("[{}] ", w.label) } else { String::new() };
-            let mode = w.mode();
-            let verdict = w.venue.snapshot().and_then(|snap| {
-                let params = w.controller.params(snap.liquidation_leverage());
-                if !w.header_shown {
-                    print_header(&prefix, w.venue.name(), &snap, &params, mode);
-                    w.header_shown = true;
-                }
-                evaluate(&snap, &params)
-            });
-            let now = Utc::now().format("%H:%M:%S");
-            let (status, line, action) = match verdict {
-                Ok(v) => (v.status, v.line, Some(v.action)),
-                Err(err) => {
-                    failed += 1;
-                    ("error", format!("error: {err:#}"), None)
-                }
-            };
-            println!("{now}  {prefix}{line}");
-            if should_alert(w.last_status, status) {
-                notifier.send(&format!("[borrowguard {}] {prefix}{line}", w.venue.name()));
-            }
-            w.last_status = status;
-
-            let traded = match (&mut w.auto, action) {
-                (Some(auto), Some(action)) => auto.act(action),
-                _ => None,
-            };
-            if let Some((msg, alert)) = traded {
-                println!("{now}  {prefix}  ↳ {msg}");
-                if alert {
-                    notifier.send(&format!("[borrowguard {}] {prefix}{msg}", w.venue.name()));
-                }
-            }
+    if settings.once {
+        let failed =
+            watched.iter_mut().map(|w| check(w, multi, notifier, false)).filter(|ok| !ok).count();
+        if failed > 0 {
+            bail!("{failed} of {} position(s) failed", watched.len());
         }
-
-        if settings.once {
-            if failed > 0 {
-                bail!("{failed} of {} position(s) failed", watched.len());
-            }
-            return Ok(());
-        }
-        thread::sleep(settings.interval);
+        return Ok(());
     }
+
+    let mut heartbeat = Instant::now();
+    loop {
+        let now = Instant::now();
+        let beat = now >= heartbeat;
+        for w in watched.iter_mut() {
+            let due = w.dirty && w.last_check.is_none_or(|t| now - t >= settings.min_check);
+            if beat || due {
+                // Between heartbeats, only print what changed.
+                check(w, multi, notifier, !beat);
+                w.dirty = false;
+                w.last_check = Some(now);
+            }
+        }
+        if beat {
+            heartbeat = now + settings.interval;
+        }
+
+        let Some(f) = &feed else {
+            thread::sleep(heartbeat.saturating_duration_since(Instant::now()));
+            continue;
+        };
+        // Sleep until the heartbeat, or until a changed position may be
+        // re-checked, whichever is sooner; wake early on a new change.
+        let wake = watched
+            .iter()
+            .filter(|w| w.dirty)
+            .filter_map(|w| w.last_check.map(|t| t + settings.min_check))
+            .fold(heartbeat, Instant::min);
+        match f.changes.recv_timeout(wake.saturating_duration_since(Instant::now())) {
+            Ok(first) => {
+                for key in std::iter::once(first).chain(f.changes.try_iter()) {
+                    for &i in f.positions.get(&key).into_iter().flatten() {
+                        watched[i].dirty = true;
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                eprintln!("account stream stopped; checking on the timer only");
+                feed = None;
+            }
+        }
+    }
+}
+
+/// Snapshot one position, report it, alert on changes and maybe trade.
+/// `quiet` prints the status line only when it changed. Returns false on error.
+fn check(w: &mut Watched, multi: bool, notifier: &Notifier, quiet: bool) -> bool {
+    let prefix = if multi { format!("[{}] ", w.label) } else { String::new() };
+    let mode = w.mode();
+    let verdict = w.venue.snapshot().and_then(|snap| {
+        let params = w.controller.params(snap.liquidation_leverage());
+        if !w.header_shown {
+            print_header(&prefix, w.venue.name(), &snap, &params, mode);
+            w.header_shown = true;
+        }
+        evaluate(&snap, &params)
+    });
+    let now = Utc::now().format("%H:%M:%S");
+    let (status, line, action) = match verdict {
+        Ok(v) => (v.status, v.line, Some(v.action)),
+        Err(err) => ("error", format!("error: {err:#}"), None),
+    };
+    if quiet {
+        w.rechecks += 1;
+    }
+    if !quiet || status != w.last_status {
+        let rechecks = match (quiet, w.rechecks) {
+            (false, n) if n > 0 => format!("  · {n} re-checks on updates"),
+            _ => String::new(),
+        };
+        println!("{now}  {prefix}{line}{rechecks}");
+    }
+    if !quiet {
+        w.rechecks = 0;
+    }
+    if should_alert(w.last_status, status) {
+        notifier.send(&format!("[borrowguard {}] {prefix}{line}", w.venue.name()));
+    }
+    w.last_status = status;
+
+    let traded = match (&mut w.auto, action) {
+        (Some(auto), Some(action)) => auto.act(action),
+        _ => None,
+    };
+    if let Some(Outcome { msg, alert, blocked }) = traded {
+        // A held-back trade repeats on every check; between heartbeats, skip it.
+        if !(quiet && blocked) {
+            println!("{now}  {prefix}  ↳ {msg}");
+        }
+        if alert {
+            notifier.send(&format!("[borrowguard {}] {prefix}{msg}", w.venue.name()));
+        }
+    }
+    status != "error"
 }
 
 /// Alert when the verdict changes, but stay quiet when a watch starts healthy.
@@ -434,7 +532,8 @@ mod tests {
         let mut a = auto(PathBuf::from("/nonexistent/STOP"));
         assert_eq!(a.act(Action::Hold), None);
         assert_eq!(a.act(Action::Insolvent), None);
-        let (msg, alert) = a.act(Action::Delever { sell: 10.0, ripcord: false }).unwrap();
+        let Outcome { msg, alert, .. } =
+            a.act(Action::Delever { sell: 10.0, ripcord: false }).unwrap();
         assert!(msg.starts_with("TRADED") && alert, "{msg}");
     }
 
@@ -459,13 +558,14 @@ mod tests {
         let stop = std::env::temp_dir().join(format!("bg-stop-{}", std::process::id()));
         std::fs::write(&stop, "").unwrap();
         let mut a = auto(stop.clone());
-        let (msg, alert) = a.act(Action::Delever { sell: 1.0, ripcord: true }).unwrap();
-        assert!(msg.contains("paused") && !alert, "{msg}");
+        let Outcome { msg, alert, blocked } =
+            a.act(Action::Delever { sell: 1.0, ripcord: true }).unwrap();
+        assert!(msg.contains("paused") && !alert && blocked, "{msg}");
         std::fs::remove_file(stop).unwrap();
         assert!(a
             .act(Action::Delever { sell: 1.0, ripcord: true })
             .unwrap()
-            .0
+            .msg
             .starts_with("TRADED"));
     }
 }

@@ -3,6 +3,7 @@ mod backtest;
 mod config;
 mod monitor;
 mod prices;
+mod stream;
 
 use std::{path::PathBuf, time::Duration};
 
@@ -19,7 +20,8 @@ use solana_client::rpc_client::RpcClient;
 
 use crate::alerts::Notifier;
 use crate::backtest::{Report, SimConfig};
-use crate::monitor::{AutoExec, Controller, Watched};
+use crate::monitor::{AutoExec, Controller, Feed, Watched};
+use crate::stream::Source;
 
 #[derive(Parser)]
 #[command(name = "borrowguard", version, about = "Keep a lending position at a target leverage")]
@@ -122,6 +124,79 @@ impl AlertArgs {
     }
 }
 
+/// How `monitor` / `watch` hear about price moves between timer checks.
+#[derive(Args)]
+struct StreamArgs {
+    /// poll: the timer only (any RPC). websocket: re-check when a price feed
+    /// or the position changes (most RPCs, free tiers too). grpc: the same
+    /// over a Yellowstone gRPC stream, fastest (needs `--features grpc`).
+    #[arg(long, env = "BORROWGUARD_STREAM", value_enum, default_value = "poll")]
+    stream: stream::Kind,
+    /// Websocket endpoint; defaults to the RPC URL with ws(s)://.
+    #[arg(long, env = "WS_URL")]
+    ws_url: Option<String>,
+    /// Yellowstone gRPC endpoint, e.g. a Helius LaserStream or Triton URL.
+    #[arg(long, env = "GRPC_URL")]
+    grpc_url: Option<String>,
+    #[arg(long, env = "GRPC_TOKEN", hide_env_values = true)]
+    grpc_token: Option<String>,
+    /// Least milliseconds between two stream-triggered checks of one position.
+    #[arg(long, default_value_t = 1_000)]
+    min_check_ms: u64,
+}
+
+impl StreamArgs {
+    fn source(&self, rpc_url: &str) -> Result<Source> {
+        Ok(match self.stream {
+            stream::Kind::Poll => Source::Poll,
+            stream::Kind::Websocket => Source::Websocket {
+                url: self.ws_url.clone().unwrap_or_else(|| stream::websocket_url(rpc_url)),
+            },
+            stream::Kind::Grpc => Source::Grpc {
+                url: self
+                    .grpc_url
+                    .clone()
+                    .context("--stream grpc needs --grpc-url (or GRPC_URL)")?,
+                token: self.grpc_token.clone(),
+            },
+        })
+    }
+}
+
+/// Subscribe to the accounts every watched position depends on.
+fn start_feed(source: &Source, watched: &[Watched]) -> Result<Option<Feed>> {
+    if matches!(source, Source::Poll) {
+        return Ok(None);
+    }
+    let mut positions: std::collections::HashMap<Pubkey, Vec<usize>> = Default::default();
+    for (i, w) in watched.iter().enumerate() {
+        match w.venue.watch_accounts() {
+            Ok(keys) => {
+                for key in keys {
+                    positions.entry(Pubkey::new_from_array(key)).or_default().push(i);
+                }
+            }
+            Err(err) => {
+                eprintln!("[{}] can't list accounts to stream ({err:#}); timer only", w.label)
+            }
+        }
+    }
+    let accounts = positions.keys().copied().collect();
+    Ok(stream::start(source, accounts)?.map(|changes| Feed { changes, positions }))
+}
+
+/// "every 10s" or "every 10s + websocket updates", for the startup line.
+fn cadence(interval: u64, source: &Source, feed: &Option<Feed>) -> String {
+    match feed {
+        Some(f) => format!(
+            "every {interval}s + {} updates on {} accounts",
+            source.name(),
+            f.positions.len()
+        ),
+        None => format!("every {interval}s"),
+    }
+}
+
 #[derive(Args)]
 struct RpcArgs {
     /// Solana RPC endpoint. `positions` needs one that allows getProgramAccounts.
@@ -210,6 +285,8 @@ struct MonitorArgs {
     payer: Option<Pubkey>,
     #[command(flatten)]
     alerts: AlertArgs,
+    #[command(flatten)]
+    stream: StreamArgs,
 }
 
 #[derive(Args)]
@@ -231,6 +308,8 @@ struct WatchArgs {
     live: bool,
     #[command(flatten)]
     alerts: AlertArgs,
+    #[command(flatten)]
+    stream: StreamArgs,
 }
 
 #[derive(Args)]
@@ -598,20 +677,22 @@ fn open_rebalancer(rpc_url: &str, position: Pubkey, owner: Pubkey) -> Result<Box
 fn run_monitor(args: MonitorArgs) -> Result<()> {
     let venue = open_venue(&args.rpc.rpc_url, args.position, args.payer)?;
     let notifier = args.alerts.notifier();
+    let (name, label) = (venue.name().to_string(), args.position.to_string());
+    let mut watched = [Watched::new(label, venue, args.controller.controller(args.band))];
+    let source = args.stream.source(&args.rpc.rpc_url)?;
+    let feed = if args.once { None } else { start_feed(&source, &watched)? };
     println!(
-        "watching {} position {} every {}s, alerts: {}",
-        venue.name(),
+        "watching {name} position {} {}, alerts: {}",
         args.position,
-        args.interval,
+        cadence(args.interval, &source, &feed),
         channels(&notifier)
     );
-    let label = args.position.to_string();
-    let mut watched = [Watched::new(label, venue, args.controller.controller(args.band))];
-    monitor::run(
-        &mut watched,
-        &notifier,
-        monitor::Settings { interval: Duration::from_secs(args.interval), once: args.once },
-    )
+    let settings = monitor::Settings {
+        interval: Duration::from_secs(args.interval),
+        once: args.once,
+        min_check: Duration::from_millis(args.stream.min_check_ms),
+    };
+    monitor::run(&mut watched, &notifier, settings, feed)
 }
 
 fn run_watch(args: WatchArgs) -> Result<()> {
@@ -636,9 +717,12 @@ fn run_watch(args: WatchArgs) -> Result<()> {
     let interval = args.interval.unwrap_or(cfg.interval_secs);
     let notifier = args.alerts.notifier();
     let trading = watched.iter().filter(|w| w.auto.is_some()).count();
+    let source = args.stream.source(rpc_url)?;
+    let feed = if args.once { None } else { start_feed(&source, &watched)? };
     println!(
-        "watching {} positions every {interval}s, alerts: {}",
+        "watching {} positions {}, alerts: {}",
         watched.len(),
+        cadence(interval, &source, &feed),
         channels(&notifier)
     );
     if trading > 0 {
@@ -652,11 +736,12 @@ fn run_watch(args: WatchArgs) -> Result<()> {
         }
     }
     println!();
-    monitor::run(
-        &mut watched,
-        &notifier,
-        monitor::Settings { interval: Duration::from_secs(interval), once: args.once },
-    )
+    let settings = monitor::Settings {
+        interval: Duration::from_secs(interval),
+        once: args.once,
+        min_check: Duration::from_millis(args.stream.min_check_ms),
+    };
+    monitor::run(&mut watched, &notifier, settings, feed)
 }
 
 /// Executor for one `execute = true` position, checked before the loop starts
