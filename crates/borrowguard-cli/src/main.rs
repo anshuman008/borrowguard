@@ -701,6 +701,9 @@ fn run_rebalance(args: RebalanceArgs) -> Result<()> {
 
     let snap = venue.snapshot()?;
     let params = args.controller.params(args.band, snap.liquidation_leverage());
+    params.validate().with_context(|| {
+        format!("controller settings vs venue liquidation at {:.2}×", snap.liquidation_leverage())
+    })?;
     let action = match (args.sell, args.borrow) {
         (Some(sell), _) => Action::Delever { sell, ripcord: false },
         (_, Some(borrow)) => Action::Relever { borrow },
