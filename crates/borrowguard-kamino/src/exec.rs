@@ -11,7 +11,7 @@
 //! repaid and any extra swap output stays in the wallet.
 
 use anyhow::{ensure, Context, Result};
-use borrowguard_core::Venue;
+use borrowguard_core::{Snapshot, Venue};
 use borrowguard_exec::{
     tx::{compose, load_lookup_tables, send_and_confirm, simulate, COMPUTE_BUDGET_IXS},
     ExecContext, Execute, Executed,
@@ -20,7 +20,7 @@ use solana_program::{instruction::Instruction, pubkey::Pubkey, system_program, s
 use solana_sdk::signer::Signer;
 
 use crate::ix;
-use crate::layout::parse_obligation;
+use crate::layout::{parse_obligation, Obligation};
 use crate::reserve::{parse_reserve, Reserve};
 use crate::{single_pair, KaminoVenue, PROGRAM_ID};
 
@@ -64,87 +64,178 @@ pub fn size_delever(
     Ok(DeleverAmounts { sell, ctokens, repay, flash_fee })
 }
 
-impl Execute for KaminoVenue {
-    fn delever(&self, ctx: &ExecContext, sell: f64, ripcord: bool) -> Result<Executed> {
-        let owner = ctx.signer.pubkey();
+/// Amounts for one relever, all in token base units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleverAmounts {
+    /// Debt token flash-borrowed and swapped into collateral.
+    pub flash: u64,
+    /// Collateral deposited: the swap's guaranteed output.
+    pub deposit: u64,
+    /// Debt borrowed against the new collateral to repay the flash loan.
+    pub borrow: u64,
+    pub flash_fee: u64,
+}
+
+/// Size a relever: borrow back exactly the flash loan plus its fee, and
+/// deposit only what the swap guarantees (any extra stays in the wallet).
+pub fn size_relever(flash: u64, min_swap_out: u64, debt: &Reserve) -> Result<ReleverAmounts> {
+    ensure!(flash > 0, "nothing to borrow");
+    ensure!(min_swap_out > 0, "swap output too small to deposit anything");
+    let flash_fee = (flash as f64 * debt.flash_loan_fee).ceil() as u64;
+    Ok(ReleverAmounts { flash, deposit: min_swap_out, borrow: flash + flash_fee, flash_fee })
+}
+
+/// Position state a rebalance needs, read fresh.
+struct Loaded {
+    obligation: Obligation,
+    coll_key: Pubkey,
+    debt_key: Pubkey,
+    coll: Reserve,
+    debt: Reserve,
+    /// Outstanding debt, base units.
+    debt_raw: u64,
+    snap: Snapshot,
+    coll_ata: Pubkey,
+    debt_ata: Pubkey,
+}
+
+impl KaminoVenue {
+    fn load(&self, owner: &Pubkey) -> Result<Loaded> {
         let obligation = parse_obligation(&self.rpc.get_account_data(&self.obligation)?)?;
         ensure!(
-            obligation.owner == owner,
+            obligation.owner == *owner,
             "signer {owner} doesn't own this obligation (owner {})",
             obligation.owner
         );
         let (deposit, borrow) = single_pair(&obligation)?;
         let (coll_key, debt_key) = (deposit.deposit_reserve, borrow.borrow_reserve);
+        let debt_raw = (borrow.borrowed_amount_sf.get() >> 60) as u64;
         let mut reserves = self.rpc.get_multiple_accounts(&[coll_key, debt_key])?.into_iter();
         let mut next = || -> Result<Reserve> {
             Ok(parse_reserve(&reserves.next().flatten().context("reserve not found")?.data)?)
         };
         let (coll, debt) = (next()?, next()?);
-
         // Price and amounts from klend's own refreshed view.
         let snap = self.snapshot()?;
-        let sell_tokens = sell / snap.price();
-        ensure!(
-            sell_tokens > 0.0 && sell_tokens < snap.collateral,
-            "can't sell {sell_tokens} of {} collateral",
-            snap.collateral
-        );
-        let sell_raw = (sell_tokens * 10f64.powi(coll.decimals as i32)).floor() as u64;
-        let debt_raw = (borrow.borrowed_amount_sf.get() >> 60) as u64;
+        let coll_ata = ix::associated_token_address(owner, &coll.mint, &coll.token_program);
+        let debt_ata = ix::associated_token_address(owner, &debt.mint, &debt.token_program);
+        Ok(Loaded {
+            obligation,
+            coll_key,
+            debt_key,
+            coll,
+            debt,
+            debt_raw,
+            snap,
+            coll_ata,
+            debt_ata,
+        })
+    }
 
-        let slippage = if ripcord { ctx.ripcord_slippage_bps } else { ctx.slippage_bps };
-        let quote =
-            ctx.jupiter.quote(&coll.mint, &debt.mint, sell_raw, slippage, MAX_SWAP_ACCOUNTS)?;
-        let amounts = size_delever(sell_raw, quote.min_out, debt_raw, &coll, &debt)?;
-        let swap = ctx.jupiter.swap_instructions(&quote, &owner)?;
+    /// klend wants reserves and the obligation refreshed right before each
+    /// action that reads them, and again after an action marks them stale.
+    fn refresh(&self, l: &Loaded) -> Vec<Instruction> {
+        vec![
+            ix::refresh_reserve(&PROGRAM_ID, &l.coll_key, &l.coll),
+            ix::refresh_reserve(&PROGRAM_ID, &l.debt_key, &l.debt),
+            ix::refresh_obligation(
+                &PROGRAM_ID,
+                &l.obligation.lending_market,
+                &self.obligation,
+                &[l.coll_key],
+                &[l.debt_key],
+                Some(&l.obligation.referrer).filter(|r| **r != Default::default()),
+            ),
+        ]
+    }
 
-        let coll_ata = ix::associated_token_address(&owner, &coll.mint, &coll.token_program);
-        let debt_ata = ix::associated_token_address(&owner, &debt.mint, &debt.token_program);
-        let refresh = || -> Vec<Instruction> {
-            vec![
-                ix::refresh_reserve(&PROGRAM_ID, &coll_key, &coll),
-                ix::refresh_reserve(&PROGRAM_ID, &debt_key, &debt),
-                ix::refresh_obligation(
-                    &PROGRAM_ID,
-                    &obligation.lending_market,
-                    &self.obligation,
-                    &[coll_key],
-                    &[debt_key],
-                    Some(&obligation.referrer).filter(|r| **r != Default::default()),
-                ),
-            ]
-        };
-
-        // Create token accounts only when missing: every byte counts in a
-        // transaction that also carries a swap route.
-        let existing = self.rpc.get_multiple_accounts(&[coll_ata, debt_ata])?;
-        let mut ixs: Vec<Instruction> = [(&coll, &existing[0]), (&debt, &existing[1])]
+    /// Create token accounts only when missing: every byte counts in a
+    /// transaction that also carries a swap route.
+    fn missing_atas(&self, owner: &Pubkey, l: &Loaded) -> Result<Vec<Instruction>> {
+        let existing = self.rpc.get_multiple_accounts(&[l.coll_ata, l.debt_ata])?;
+        Ok([(&l.coll, &existing[0]), (&l.debt, &existing[1])]
             .into_iter()
             .filter(|(_, account)| account.is_none())
             .map(|(reserve, _)| {
-                ix::create_ata_idempotent(&owner, &reserve.mint, &reserve.token_program)
+                ix::create_ata_idempotent(owner, &reserve.mint, &reserve.token_program)
             })
-            .collect();
+            .collect())
+    }
+
+    /// Simulate, then (if `ctx.send`) re-sign with a tight compute budget and send.
+    fn finish(
+        &self,
+        ctx: &ExecContext,
+        ixs: &[Instruction],
+        swap_tables: &[Pubkey],
+        summary: impl Fn(u64) -> String,
+    ) -> Result<Executed> {
+        let tables: Vec<_> = ctx.lookup_tables.iter().chain(swap_tables).copied().collect();
+        let tables = load_lookup_tables(&ctx.rpc, &tables)?;
+        let tx = compose(&ctx.rpc, &ctx.signer, ixs, &tables, SIMULATION_CU, ctx.priority_fee)?;
+        let sim = simulate(&ctx.rpc, &tx)?;
+        let summary = summary(sim.units);
+        if !ctx.send {
+            return Ok(Executed::Simulated { units: sim.units, summary });
+        }
+        let units = (sim.units as f64 * 1.2) as u32 + 10_000;
+        let tx = compose(&ctx.rpc, &ctx.signer, ixs, &tables, units, ctx.priority_fee)?;
+        simulate(&ctx.rpc, &tx).context("re-simulating with tightened compute budget")?;
+        let signature = send_and_confirm(&ctx.rpc, &tx)?;
+        Ok(Executed::Sent { signature: signature.to_string(), summary })
+    }
+}
+
+fn scale(raw: u64, decimals: u32) -> f64 {
+    raw as f64 / 10f64.powi(decimals as i32)
+}
+
+impl Execute for KaminoVenue {
+    fn delever(&self, ctx: &ExecContext, sell: f64, ripcord: bool) -> Result<Executed> {
+        let owner = ctx.signer.pubkey();
+        let l = self.load(&owner)?;
+        let sell_tokens = sell / l.snap.price();
+        ensure!(
+            sell_tokens > 0.0 && sell_tokens < l.snap.collateral,
+            "can't sell {sell_tokens} of {} collateral",
+            l.snap.collateral
+        );
+        let sell_raw = (sell_tokens * 10f64.powi(l.coll.decimals as i32)).floor() as u64;
+
+        let slippage = if ripcord { ctx.ripcord_slippage_bps } else { ctx.slippage_bps };
+        let quote =
+            ctx.jupiter.quote(&l.coll.mint, &l.debt.mint, sell_raw, slippage, MAX_SWAP_ACCOUNTS)?;
+        let amounts = size_delever(sell_raw, quote.min_out, l.debt_raw, &l.coll, &l.debt)?;
+        let swap = ctx.jupiter.swap_instructions(&quote, &owner)?;
+
+        let mut ixs = self.missing_atas(&owner, &l)?;
         let borrow_index = (COMPUTE_BUDGET_IXS + ixs.len()) as u8;
-        ixs.push(ix::flash_borrow(&PROGRAM_ID, &owner, &debt_key, &debt, &debt_ata, amounts.repay));
-        ixs.extend(refresh());
+        ixs.push(ix::flash_borrow(
+            &PROGRAM_ID,
+            &owner,
+            &l.debt_key,
+            &l.debt,
+            &l.debt_ata,
+            amounts.repay,
+        ));
+        ixs.extend(self.refresh(&l));
         ixs.push(ix::repay_v2(
             &PROGRAM_ID,
             &owner,
             &self.obligation,
-            &debt_key,
-            &debt,
-            &debt_ata,
+            &l.debt_key,
+            &l.debt,
+            &l.debt_ata,
             amounts.repay,
         ));
-        ixs.extend(refresh());
+        ixs.extend(self.refresh(&l));
         ixs.push(ix::withdraw_v2(
             &PROGRAM_ID,
             &owner,
             &self.obligation,
-            &coll_key,
-            &coll,
-            &coll_ata,
+            &l.coll_key,
+            &l.coll,
+            &l.coll_ata,
             amounts.ctokens,
         ));
         ixs.extend(swap.setup);
@@ -153,40 +244,100 @@ impl Execute for KaminoVenue {
         ixs.push(ix::flash_repay(
             &PROGRAM_ID,
             &owner,
-            &debt_key,
-            &debt,
-            &debt_ata,
+            &l.debt_key,
+            &l.debt,
+            &l.debt_ata,
             amounts.repay,
             borrow_index,
         ));
 
-        let tables: Vec<_> = ctx.lookup_tables.iter().chain(&swap.lookup_tables).copied().collect();
-        let tables = load_lookup_tables(&ctx.rpc, &tables)?;
-        let tx = compose(&ctx.rpc, &ctx.signer, &ixs, &tables, SIMULATION_CU, ctx.priority_fee)?;
-        let sim = simulate(&ctx.rpc, &tx)?;
-        let units = (sim.units as f64 * 1.2) as u32 + 10_000;
+        let (coll_sym, debt_sym) = (&l.snap.collateral_symbol, &l.snap.debt_symbol);
+        self.finish(ctx, &ixs, &swap.lookup_tables, |units| {
+            format!(
+                "{}sell {:.6} {coll_sym} → ≥{:.4} {debt_sym} (quote {:.4}, impact {:.3}%), repay {:.4} {debt_sym}, {units} CU",
+                if ripcord { "RIPCORD " } else { "" },
+                scale(amounts.sell, l.coll.decimals),
+                scale(quote.min_out, l.debt.decimals),
+                scale(quote.out_amount, l.debt.decimals),
+                quote.price_impact_pct * 100.0,
+                scale(amounts.repay, l.debt.decimals),
+            )
+        })
+    }
 
-        let scale = |raw: u64, decimals: u32| raw as f64 / 10f64.powi(decimals as i32);
-        let summary = format!(
-            "{}sell {:.6} {} → ≥{:.4} {} (quote {:.4}, impact {:.3}%), repay {:.4} {}, {} CU",
-            if ripcord { "RIPCORD " } else { "" },
-            scale(amounts.sell, coll.decimals),
-            snap.collateral_symbol,
-            scale(quote.min_out, debt.decimals),
-            snap.debt_symbol,
-            scale(quote.out_amount, debt.decimals),
-            quote.price_impact_pct * 100.0,
-            scale(amounts.repay, debt.decimals),
-            snap.debt_symbol,
-            sim.units,
-        );
-        if !ctx.send {
-            return Ok(Executed::Simulated { units: sim.units, summary });
-        }
-        let tx = compose(&ctx.rpc, &ctx.signer, &ixs, &tables, units, ctx.priority_fee)?;
-        simulate(&ctx.rpc, &tx).context("re-simulating with tightened compute budget")?;
-        let signature = send_and_confirm(&ctx.rpc, &tx)?;
-        Ok(Executed::Sent { signature: signature.to_string(), summary })
+    fn relever(&self, ctx: &ExecContext, borrow: f64) -> Result<Executed> {
+        let owner = ctx.signer.pubkey();
+        let l = self.load(&owner)?;
+        let flash_raw = (borrow * 10f64.powi(l.debt.decimals as i32)).floor() as u64;
+
+        let quote = ctx.jupiter.quote(
+            &l.debt.mint,
+            &l.coll.mint,
+            flash_raw,
+            ctx.slippage_bps,
+            MAX_SWAP_ACCOUNTS,
+        )?;
+        let amounts = size_relever(flash_raw, quote.min_out, &l.debt)?;
+        let swap = ctx.jupiter.swap_instructions(&quote, &owner)?;
+        // Elevation-group obligations must show their deposits to borrow.
+        let emode_deposits =
+            if l.obligation.elevation_group > 0 { vec![l.coll_key] } else { vec![] };
+
+        let mut ixs = self.missing_atas(&owner, &l)?;
+        let borrow_index = (COMPUTE_BUDGET_IXS + ixs.len()) as u8;
+        ixs.push(ix::flash_borrow(
+            &PROGRAM_ID,
+            &owner,
+            &l.debt_key,
+            &l.debt,
+            &l.debt_ata,
+            amounts.flash,
+        ));
+        ixs.extend(swap.setup);
+        ixs.push(swap.swap);
+        ixs.extend(swap.cleanup);
+        ixs.extend(self.refresh(&l));
+        ixs.push(ix::deposit_v2(
+            &PROGRAM_ID,
+            &owner,
+            &self.obligation,
+            &l.coll_key,
+            &l.coll,
+            &l.coll_ata,
+            amounts.deposit,
+        ));
+        ixs.extend(self.refresh(&l));
+        ixs.push(ix::borrow_v2(
+            &PROGRAM_ID,
+            &owner,
+            &self.obligation,
+            &l.debt_key,
+            &l.debt,
+            &l.debt_ata,
+            amounts.borrow,
+            &emode_deposits,
+        ));
+        ixs.push(ix::flash_repay(
+            &PROGRAM_ID,
+            &owner,
+            &l.debt_key,
+            &l.debt,
+            &l.debt_ata,
+            amounts.flash,
+            borrow_index,
+        ));
+
+        let (coll_sym, debt_sym) = (&l.snap.collateral_symbol, &l.snap.debt_symbol);
+        self.finish(ctx, &ixs, &swap.lookup_tables, |units| {
+            format!(
+                "borrow {:.4} {debt_sym} → ≥{:.6} {coll_sym} (quote {:.6}, impact {:.3}%), deposit {:.6} {coll_sym}, {units} CU",
+                scale(amounts.borrow, l.debt.decimals),
+                scale(quote.min_out, l.coll.decimals),
+                scale(quote.out_amount, l.coll.decimals),
+                quote.price_impact_pct * 100.0,
+                scale(amounts.deposit, l.coll.decimals),
+            )
+        })
     }
 
     fn static_accounts(&self, owner: &Pubkey) -> Result<Vec<Pubkey>> {
@@ -267,6 +418,16 @@ mod tests {
         let a = size_delever(110_000, 10_000_000, 50_000_000, &coll, &debt).unwrap();
         assert!(a.repay + a.flash_fee <= 10_000_000);
         assert!(a.repay > 9_980_000);
+    }
+
+    #[test]
+    fn relever_borrows_back_flash_loan_plus_fee() {
+        let (_, debt) = reserves(0.001);
+        let a = size_relever(100_000_000, 950_000_000, &debt).unwrap();
+        assert_eq!((a.flash, a.deposit, a.flash_fee), (100_000_000, 950_000_000, 100_000));
+        assert_eq!(a.borrow, 100_100_000);
+        assert!(size_relever(0, 1, &debt).is_err());
+        assert!(size_relever(1, 0, &debt).is_err());
     }
 
     #[test]
