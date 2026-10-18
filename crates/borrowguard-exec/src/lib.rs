@@ -5,15 +5,23 @@
 //! sent unless [`ExecContext::send`] is set.
 
 pub mod jupiter;
+pub mod token;
 pub mod tx;
 
 use std::path::Path;
 
 use anyhow::{ensure, Context, Result};
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair};
+use solana_sdk::{
+    commitment_config::CommitmentConfig, instruction::Instruction, pubkey::Pubkey,
+    signature::Keypair,
+};
 
 use crate::jupiter::Jupiter;
+use crate::tx::{compose, load_lookup_tables, send_and_confirm, simulate};
+
+/// Generous first-pass compute budget; tightened to the simulated usage.
+const SIMULATION_CU: u32 = 1_400_000;
 
 pub struct ExecContext {
     pub rpc: RpcClient,
@@ -34,6 +42,29 @@ pub struct ExecContext {
 impl ExecContext {
     pub fn rpc(url: &str) -> RpcClient {
         RpcClient::new_with_commitment(url.to_string(), CommitmentConfig::confirmed())
+    }
+
+    /// Simulate `ixs`, then (if [`Self::send`]) re-sign with a compute budget
+    /// tightened to the simulated usage and send. `summary` gets the units used.
+    pub fn run(
+        &self,
+        ixs: &[Instruction],
+        extra_tables: &[Pubkey],
+        summary: impl Fn(u64) -> String,
+    ) -> Result<Executed> {
+        let tables: Vec<_> = self.lookup_tables.iter().chain(extra_tables).copied().collect();
+        let tables = load_lookup_tables(&self.rpc, &tables)?;
+        let tx = compose(&self.rpc, &self.signer, ixs, &tables, SIMULATION_CU, self.priority_fee)?;
+        let sim = simulate(&self.rpc, &tx)?;
+        let summary = summary(sim.units);
+        if !self.send {
+            return Ok(Executed::Simulated { units: sim.units, summary });
+        }
+        let units = (sim.units as f64 * 1.2) as u32 + 10_000;
+        let tx = compose(&self.rpc, &self.signer, ixs, &tables, units, self.priority_fee)?;
+        simulate(&self.rpc, &tx).context("re-simulating with tightened compute budget")?;
+        let signature = send_and_confirm(&self.rpc, &tx)?;
+        Ok(Executed::Sent { signature: signature.to_string(), summary })
     }
 }
 

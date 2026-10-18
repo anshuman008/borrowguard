@@ -12,10 +12,7 @@
 
 use anyhow::{ensure, Context, Result};
 use borrowguard_core::{Snapshot, Venue};
-use borrowguard_exec::{
-    tx::{compose, load_lookup_tables, send_and_confirm, simulate, COMPUTE_BUDGET_IXS},
-    ExecContext, Execute, Executed,
-};
+use borrowguard_exec::{tx::COMPUTE_BUDGET_IXS, ExecContext, Execute, Executed};
 use solana_program::{instruction::Instruction, pubkey::Pubkey, system_program, sysvar};
 use solana_sdk::signer::Signer;
 
@@ -26,8 +23,6 @@ use crate::{single_pair, KaminoVenue, PROGRAM_ID};
 
 /// Route size cap so the swap fits beside ~10 klend instructions.
 const MAX_SWAP_ACCOUNTS: u8 = 20;
-/// Generous first-pass compute budget; tightened to the simulated usage.
-const SIMULATION_CU: u32 = 1_400_000;
 
 /// Amounts for one delever, all in token base units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,29 +156,6 @@ impl KaminoVenue {
             })
             .collect())
     }
-
-    /// Simulate, then (if `ctx.send`) re-sign with a tight compute budget and send.
-    fn finish(
-        &self,
-        ctx: &ExecContext,
-        ixs: &[Instruction],
-        swap_tables: &[Pubkey],
-        summary: impl Fn(u64) -> String,
-    ) -> Result<Executed> {
-        let tables: Vec<_> = ctx.lookup_tables.iter().chain(swap_tables).copied().collect();
-        let tables = load_lookup_tables(&ctx.rpc, &tables)?;
-        let tx = compose(&ctx.rpc, &ctx.signer, ixs, &tables, SIMULATION_CU, ctx.priority_fee)?;
-        let sim = simulate(&ctx.rpc, &tx)?;
-        let summary = summary(sim.units);
-        if !ctx.send {
-            return Ok(Executed::Simulated { units: sim.units, summary });
-        }
-        let units = (sim.units as f64 * 1.2) as u32 + 10_000;
-        let tx = compose(&ctx.rpc, &ctx.signer, ixs, &tables, units, ctx.priority_fee)?;
-        simulate(&ctx.rpc, &tx).context("re-simulating with tightened compute budget")?;
-        let signature = send_and_confirm(&ctx.rpc, &tx)?;
-        Ok(Executed::Sent { signature: signature.to_string(), summary })
-    }
 }
 
 fn scale(raw: u64, decimals: u32) -> f64 {
@@ -252,7 +224,7 @@ impl Execute for KaminoVenue {
         ));
 
         let (coll_sym, debt_sym) = (&l.snap.collateral_symbol, &l.snap.debt_symbol);
-        self.finish(ctx, &ixs, &swap.lookup_tables, |units| {
+        ctx.run(&ixs, &swap.lookup_tables, |units| {
             format!(
                 "{}sell {:.6} {coll_sym} → ≥{:.4} {debt_sym} (quote {:.4}, impact {:.3}%), repay {:.4} {debt_sym}, {units} CU",
                 if ripcord { "RIPCORD " } else { "" },
@@ -328,7 +300,7 @@ impl Execute for KaminoVenue {
         ));
 
         let (coll_sym, debt_sym) = (&l.snap.collateral_symbol, &l.snap.debt_symbol);
-        self.finish(ctx, &ixs, &swap.lookup_tables, |units| {
+        ctx.run(&ixs, &swap.lookup_tables, |units| {
             format!(
                 "borrow {:.4} {debt_sym} → ≥{:.6} {coll_sym} (quote {:.6}, impact {:.3}%), deposit {:.6} {coll_sym}, {units} CU",
                 scale(amounts.borrow, l.debt.decimals),

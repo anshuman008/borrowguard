@@ -5,7 +5,11 @@ use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey,
     pubkey::Pubkey,
-    system_program, sysvar,
+    sysvar,
+};
+
+pub use borrowguard_exec::token::{
+    associated_token_address, create_ata_idempotent, ASSOCIATED_TOKEN_PROGRAM_ID,
 };
 
 use crate::layout::discriminator;
@@ -67,8 +71,6 @@ fn referrer_token_state(program_id: &Pubkey, referrer: &Pubkey, reserve: &Pubkey
 }
 
 pub const FARMS_PROGRAM_ID: Pubkey = pubkey!("FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr");
-pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
-    pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
 pub fn lending_market_authority(program_id: &Pubkey, lending_market: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"lma", lending_market.as_ref()], program_id).0
@@ -78,30 +80,6 @@ pub fn lending_market_authority(program_id: &Pubkey, lending_market: &Pubkey) ->
 pub fn obligation_farm_user_state(farm: &Pubkey, obligation: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"user", farm.as_ref(), obligation.as_ref()], &FARMS_PROGRAM_ID)
         .0
-}
-
-pub fn associated_token_address(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
-        &ASSOCIATED_TOKEN_PROGRAM_ID,
-    )
-    .0
-}
-
-/// Associated-token-program `CreateIdempotent`: no-op if the account exists.
-pub fn create_ata_idempotent(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Instruction {
-    Instruction {
-        program_id: ASSOCIATED_TOKEN_PROGRAM_ID,
-        accounts: vec![
-            AccountMeta::new(*owner, true),
-            AccountMeta::new(associated_token_address(owner, mint, token_program), false),
-            AccountMeta::new_readonly(*owner, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-            AccountMeta::new_readonly(*token_program, false),
-        ],
-        data: vec![1],
-    }
 }
 
 fn with_amount(name: &str, amount: u64) -> Vec<u8> {
