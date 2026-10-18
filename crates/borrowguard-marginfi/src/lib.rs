@@ -51,21 +51,20 @@ impl MarginfiVenue {
 
     /// The wallet that controls the account.
     pub fn owner(&self) -> Result<Pubkey> {
-        Ok(parse_account(&self.rpc.get_account_data(&self.account)?)?.authority)
-    }
-}
-
-impl Venue for MarginfiVenue {
-    fn name(&self) -> &str {
-        "marginfi"
+        Ok(self.account()?.authority)
     }
 
-    fn snapshot(&self) -> Result<Snapshot> {
+    /// The account as last written on chain (its health cache may be stale).
+    pub fn account(&self) -> Result<MarginfiAccount> {
         let data = self.rpc.get_account_data(&self.account).with_context(|| {
             format!("fetch marginfi account {} (closed, or not a mainnet address?)", self.account)
         })?;
-        let account = parse_account(&data)?;
-        single_pair(&account)?;
+        parse_account(&data)
+    }
+
+    /// Simulate `lending_account_pulse_health` on `account` and return it with a
+    /// fresh health cache, its banks in balance order, and the slot.
+    pub fn pulse(&self, account: &MarginfiAccount) -> Result<(MarginfiAccount, Vec<Bank>, u64)> {
         let keys: Vec<Pubkey> = account.balances.iter().map(|b| b.bank).collect();
         let mut banks = Vec::with_capacity(keys.len());
         for (key, bank) in keys.iter().zip(self.rpc.get_multiple_accounts(&keys)?) {
@@ -73,7 +72,7 @@ impl Venue for MarginfiVenue {
             banks.push((*key, parse_bank(&bank.data)?));
         }
 
-        let ix = pulse_health(&self.account, &account, &banks)?;
+        let ix = pulse_health(&self.account, account, &banks)?;
         let payer = self.payer.unwrap_or(account.authority);
         let tx = Transaction::new_unsigned(Message::new(&[ix], Some(&payer)));
         let sim = self
@@ -102,8 +101,21 @@ impl Venue for MarginfiVenue {
             .and_then(|accounts| accounts.into_iter().next().flatten())
             .and_then(|a| a.data.decode())
             .context("RPC returned no simulated account")?;
-        let banks: Vec<Bank> = banks.into_iter().map(|(_, bank)| bank).collect();
-        snapshot_from(&parse_account(&fresh)?, &banks, sim.context.slot)
+        let banks = banks.into_iter().map(|(_, bank)| bank).collect();
+        Ok((parse_account(&fresh)?, banks, sim.context.slot))
+    }
+}
+
+impl Venue for MarginfiVenue {
+    fn name(&self) -> &str {
+        "marginfi"
+    }
+
+    fn snapshot(&self) -> Result<Snapshot> {
+        let account = self.account()?;
+        single_pair(&account)?;
+        let (account, banks, slot) = self.pulse(&account)?;
+        snapshot_from(&account, &banks, slot)
     }
 }
 
