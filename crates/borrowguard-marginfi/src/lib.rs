@@ -23,7 +23,10 @@ use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey,
 };
-use solana_sdk::{commitment_config::CommitmentConfig, message::Message, transaction::Transaction};
+use solana_sdk::{
+    commitment_config::CommitmentConfig, compute_budget::ComputeBudgetInstruction,
+    message::Message, transaction::Transaction,
+};
 
 use crate::layout::{
     parse_account, parse_bank, Balance, Bank, MarginfiAccount, ACCOUNT_LEN, AUTHORITY_OFFSET,
@@ -74,7 +77,10 @@ impl MarginfiVenue {
 
         let ix = pulse_health(&self.account, account, &banks)?;
         let payer = self.payer.unwrap_or(account.authority);
-        let tx = Transaction::new_unsigned(Message::new(&[ix], Some(&payer)));
+        // Health checks cost ~50k CU per balance, more for LST banks; the
+        // simulation is free, so allow the maximum.
+        let budget = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+        let tx = Transaction::new_unsigned(Message::new(&[budget, ix], Some(&payer)));
         let sim = self
             .rpc
             .simulate_transaction_with_config(
