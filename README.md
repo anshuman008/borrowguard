@@ -1,12 +1,13 @@
 # BorrowGuard
 
-An open-source Rust bot that keeps **your own** Kamino lending position at a
-target leverage, so it never drifts into liquidation.
+An open-source Rust bot that keeps **your own** Solana lending positions
+(Kamino, Jupiter Lend, Project 0 / marginfi) at a target leverage, so they
+never drift into liquidation.
 
-Think of it as a constant-leverage fund for one person. The controller design
-follows constant-leverage funds: a target,
-a no-trade band, an emergency "ripcord" and flash-loan rebalancing. It runs
-against a position you own instead of a pooled vault.
+You pick a target leverage, a no-trade band around it and an emergency
+"ripcord" level. When leverage leaves the band, BorrowGuard alerts you and (on
+Kamino, so far) rebalances the position with a flash loan, in one transaction,
+from your own wallet.
 
 > **Status: early.** The controller core, backtester and live monitor (Kamino,
 > Jupiter Lend, Project 0 / marginfi) work. Kamino **rebalancing in both directions** (delever and
