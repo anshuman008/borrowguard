@@ -8,5 +8,8 @@
 id.json
 keypairs/
 
+# Your positions (start from borrowguard.example.toml)
+/borrowguard.toml
+
 # Downloaded price data (regenerate with `borrowguard fetch-prices`)
 /data

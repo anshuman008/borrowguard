@@ -1,5 +1,6 @@
 mod alerts;
 mod backtest;
+mod config;
 mod monitor;
 mod prices;
 
@@ -16,6 +17,7 @@ use solana_client::rpc_client::RpcClient;
 
 use crate::alerts::Notifier;
 use crate::backtest::{Report, SimConfig};
+use crate::monitor::{Controller, Watched};
 
 #[derive(Parser)]
 #[command(name = "borrowguard", version, about = "Keep a lending position at a target leverage")]
@@ -36,41 +38,64 @@ enum Cmd {
     /// controller would do.
     /// Read-only: never sends a transaction.
     Monitor(MonitorArgs),
+    /// Watch every position listed in a config file (see borrowguard.example.toml).
+    /// Read-only: never sends a transaction.
+    Watch(WatchArgs),
 }
 
 /// Controller settings shared by `backtest` and `monitor`.
 #[derive(Args)]
 struct ControllerArgs {
-    #[arg(long, default_value_t = 3.0)]
+    #[arg(long, default_value_t = Controller::DEFAULT.target)]
     target: f64,
-    #[arg(long, default_value_t = 3.6)]
+    #[arg(long, default_value_t = Controller::DEFAULT.ripcord)]
     ripcord: f64,
     /// Slippage + fees per routine trade, in basis points.
-    #[arg(long, default_value_t = 30.0)]
+    #[arg(long, default_value_t = Controller::DEFAULT.cost_bps)]
     cost_bps: f64,
     /// Slippage + fees per ripcord trade, in basis points.
-    #[arg(long, default_value_t = 100.0)]
+    #[arg(long, default_value_t = Controller::DEFAULT.ripcord_cost_bps)]
     ripcord_cost_bps: f64,
     /// Max quote value per routine trade.
     #[arg(long)]
     max_trade: Option<f64>,
     /// Skip routine trades smaller than this (quote).
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = Controller::DEFAULT.min_trade)]
     min_trade: f64,
 }
 
 impl ControllerArgs {
-    fn params(&self, band: f64, liquidation: f64) -> Params {
-        Params {
+    fn controller(&self, band: f64) -> Controller {
+        Controller {
             target: self.target,
             band,
             ripcord: self.ripcord,
-            liquidation,
-            cost: self.cost_bps / 10_000.0,
-            ripcord_cost: self.ripcord_cost_bps / 10_000.0,
+            cost_bps: self.cost_bps,
+            ripcord_cost_bps: self.ripcord_cost_bps,
             max_trade: self.max_trade,
             min_trade: self.min_trade,
         }
+    }
+
+    fn params(&self, band: f64, liquidation: f64) -> Params {
+        self.controller(band).params(liquidation)
+    }
+}
+
+/// Telegram / Discord alert credentials, usually from `.env`.
+#[derive(Args)]
+struct AlertArgs {
+    #[arg(long, env = "TELEGRAM_BOT_TOKEN", hide_env_values = true)]
+    telegram_bot_token: Option<String>,
+    #[arg(long, env = "TELEGRAM_CHAT_ID")]
+    telegram_chat_id: Option<String>,
+    #[arg(long, env = "DISCORD_WEBHOOK_URL", hide_env_values = true)]
+    discord_webhook_url: Option<String>,
+}
+
+impl AlertArgs {
+    fn notifier(self) -> Notifier {
+        Notifier::new(self.telegram_bot_token, self.telegram_chat_id, self.discord_webhook_url)
     }
 }
 
@@ -148,7 +173,7 @@ struct MonitorArgs {
     #[command(flatten)]
     controller: ControllerArgs,
     /// No-trade band half-width around the target.
-    #[arg(long, default_value_t = 0.15)]
+    #[arg(long, default_value_t = Controller::DEFAULT.band)]
     band: f64,
     /// Seconds between checks.
     #[arg(long, default_value_t = 10)]
@@ -159,12 +184,25 @@ struct MonitorArgs {
     /// Fee payer for read-only simulations; defaults to the position owner.
     #[arg(long)]
     payer: Option<Pubkey>,
-    #[arg(long, env = "TELEGRAM_BOT_TOKEN", hide_env_values = true)]
-    telegram_bot_token: Option<String>,
-    #[arg(long, env = "TELEGRAM_CHAT_ID")]
-    telegram_chat_id: Option<String>,
-    #[arg(long, env = "DISCORD_WEBHOOK_URL", hide_env_values = true)]
-    discord_webhook_url: Option<String>,
+    #[command(flatten)]
+    alerts: AlertArgs,
+}
+
+#[derive(Args)]
+struct WatchArgs {
+    /// Positions to watch, with per-position settings.
+    #[arg(long, default_value = "borrowguard.toml")]
+    config: PathBuf,
+    #[command(flatten)]
+    rpc: RpcArgs,
+    /// Seconds between rounds; overrides `interval_secs` in the config.
+    #[arg(long)]
+    interval: Option<u64>,
+    /// Check every position once and exit (non-zero if any failed).
+    #[arg(long)]
+    once: bool,
+    #[command(flatten)]
+    alerts: AlertArgs,
 }
 
 fn main() -> Result<()> {
@@ -174,6 +212,7 @@ fn main() -> Result<()> {
         Cmd::Backtest(args) => run_backtest(args),
         Cmd::Positions(args) => positions(args),
         Cmd::Monitor(args) => run_monitor(args),
+        Cmd::Watch(args) => run_watch(args),
     }
 }
 
@@ -366,22 +405,53 @@ fn open_venue(rpc_url: &str, position: Pubkey, payer: Option<Pubkey>) -> Result<
 
 fn run_monitor(args: MonitorArgs) -> Result<()> {
     let venue = open_venue(&args.rpc.rpc_url, args.position, args.payer)?;
-    let notifier =
-        Notifier::new(args.telegram_bot_token, args.telegram_chat_id, args.discord_webhook_url);
-    let channels = notifier.channels();
+    let notifier = args.alerts.notifier();
     println!(
         "watching {} position {} every {}s, alerts: {}",
         venue.name(),
         args.position,
         args.interval,
-        if channels.is_empty() { "off".to_string() } else { channels.join(", ") }
+        channels(&notifier)
     );
+    let label = args.position.to_string();
+    let mut watched = [Watched::new(label, venue, args.controller.controller(args.band))];
     monitor::run(
-        venue.as_ref(),
-        |liquidation| args.controller.params(args.band, liquidation),
+        &mut watched,
         &notifier,
         monitor::Settings { interval: Duration::from_secs(args.interval), once: args.once },
     )
+}
+
+fn run_watch(args: WatchArgs) -> Result<()> {
+    let cfg = config::load(&args.config)?;
+    let mut watched = Vec::with_capacity(cfg.positions.len());
+    for p in cfg.positions {
+        let venue = open_venue(&args.rpc.rpc_url, p.address, p.payer)
+            .with_context(|| format!("position \"{}\"", p.label))?;
+        println!("  {:<24} {:<8} {}", p.label, venue.name(), p.address);
+        watched.push(Watched::new(p.label, venue, p.controller));
+    }
+    let interval = args.interval.unwrap_or(cfg.interval_secs);
+    let notifier = args.alerts.notifier();
+    println!(
+        "watching {} positions every {interval}s, alerts: {}\n",
+        watched.len(),
+        channels(&notifier)
+    );
+    monitor::run(
+        &mut watched,
+        &notifier,
+        monitor::Settings { interval: Duration::from_secs(interval), once: args.once },
+    )
+}
+
+fn channels(notifier: &Notifier) -> String {
+    let channels = notifier.channels();
+    if channels.is_empty() {
+        "off".to_string()
+    } else {
+        channels.join(", ")
+    }
 }
 
 fn date(ms: i64) -> String {

@@ -1,0 +1,34 @@
+# Copy to borrowguard.toml (gitignored) and run:
+#   borrowguard watch
+#
+# Find your position addresses with:
+#   borrowguard positions --owner <YOUR_WALLET>
+
+# Seconds between checks.
+interval_secs = 10
+
+# Applies to every position unless the position sets its own value.
+[defaults]
+# Fee payer for read-only simulations: any wallet with a little SOL, normally
+# your own. Required for Jupiter Lend on RPCs that throttle owner lookups.
+# payer = "<YOUR_WALLET>"
+target = 3.0           # leverage every rebalance returns to
+band = 0.15            # no-trade zone: target ± band
+ripcord = 3.6          # emergency delever level, below the venue's liquidation
+cost_bps = 30          # expected slippage + fees per routine trade
+ripcord_cost_bps = 100 # same, for ripcord trades
+min_trade = 1.0        # skip routine trades smaller than this (debt token units)
+# max_trade = 5000.0   # cap routine trades (debt token units)
+
+# One block per position. The venue (Kamino or Jupiter Lend) is detected
+# from the address.
+[[position]]
+address = "2w9MS6MBFr68VpF6dkGwb2ucdKTpNFeXwmS79HSDTxAG"
+label = "kamino jitosol loop"
+target = 12.0
+band = 0.4
+ripcord = 15.0
+
+[[position]]
+address = "9wG4DVpiJgbBu4chpRGZkKSoQQe9NcochTA3dAgs3eic"
+label = "jupiter sol/usdc"
