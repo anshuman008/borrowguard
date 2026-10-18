@@ -10,7 +10,11 @@ const DISCRIMINATOR_LEN: usize = 8;
 /// Byte offset of `Position::position_mint` in the full account (for gPA filters).
 pub const POSITION_MINT_OFFSET: usize = DISCRIMINATOR_LEN + 6;
 const VAULT_CONFIG_PAYLOAD_LEN: usize = 211;
+const VAULT_STATE_PAYLOAD_LEN: usize = 119;
+const VAULT_METADATA_PAYLOAD_LEN: usize = 34;
 const TICK_PAYLOAD_LEN: usize = 32;
+const TICK_HAS_DEBT_PAYLOAD_LEN: usize = 3 + 8 * 32;
+const FLASHLOAN_ADMIN_PAYLOAD_LEN: usize = 67;
 const ORACLE_SOURCE_LEN: usize = 66;
 
 /// Anchor discriminator: `sha256("<namespace>:<name>")[..8]`.
@@ -79,7 +83,10 @@ pub struct VaultConfig {
     pub collateral_factor: u16,
     /// LTV at which positions get liquidated, per mille.
     pub liquidation_threshold: u16,
+    /// Fee added to new borrows, in basis points.
+    pub borrow_fee: u16,
     pub oracle: Pubkey,
+    pub oracle_program: Pubkey,
     /// Collateral mint.
     pub supply_token: Pubkey,
     /// Debt mint.
@@ -92,10 +99,83 @@ pub fn parse_vault_config(data: &[u8]) -> Result<VaultConfig> {
         vault_id: u16::from_le_bytes(bytes(p, 0)),
         collateral_factor: u16::from_le_bytes(bytes(p, 6)),
         liquidation_threshold: u16::from_le_bytes(bytes(p, 8)),
+        borrow_fee: u16::from_le_bytes(bytes(p, 16)),
         oracle: pubkey(p, 18),
+        oracle_program: pubkey(p, 114),
         supply_token: pubkey(p, 146),
         borrow_token: pubkey(p, 178),
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaultState {
+    /// The current branch was liquidated; the next debt opens a new one.
+    pub branch_liquidated: bool,
+    pub topmost_tick: i32,
+    pub current_branch_id: u32,
+    pub total_branch_id: u32,
+}
+
+pub fn parse_vault_state(data: &[u8]) -> Result<VaultState> {
+    let p = payload(data, "VaultState", VAULT_STATE_PAYLOAD_LEN)?;
+    Ok(VaultState {
+        branch_liquidated: p[2] == 1,
+        topmost_tick: i32::from_le_bytes(bytes(p, 3)),
+        current_branch_id: u32::from_le_bytes(bytes(p, 7)),
+        total_branch_id: u32::from_le_bytes(bytes(p, 11)),
+    })
+}
+
+/// The vault's own address lookup table.
+pub fn parse_vault_metadata(data: &[u8]) -> Result<Pubkey> {
+    Ok(pubkey(payload(data, "VaultMetadata", VAULT_METADATA_PAYLOAD_LEN)?, 2))
+}
+
+/// Flash loan fee in basis points, from the flashloan program's admin account.
+pub fn parse_flashloan_fee(data: &[u8]) -> Result<u16> {
+    Ok(u16::from_le_bytes(bytes(payload(data, "FlashloanAdmin", FLASHLOAN_ADMIN_PAYLOAD_LEN)?, 65)))
+}
+
+/// SPL mint decimals (Token and Token-2022 share the base layout).
+pub fn mint_decimals(data: &[u8]) -> Result<u8> {
+    ensure!(data.len() >= 82, "not a mint account");
+    Ok(data[44])
+}
+
+/// Ticks per `TickHasDebtArray`: 8 bitmaps of 256 ticks.
+pub const TICKS_PER_ARRAY: i32 = 2_048;
+
+/// Index of the `TickHasDebtArray` holding `tick`.
+pub fn tick_has_debt_index(tick: i32) -> u8 {
+    ((tick - crate::tick::MIN_TICK) / TICKS_PER_ARRAY) as u8
+}
+
+/// One `TickHasDebtArray`: a bit per tick, set while the tick holds debt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TickHasDebtArray {
+    pub index: u8,
+    bits: [u8; 256],
+}
+
+pub fn parse_tick_has_debt(data: &[u8]) -> Result<TickHasDebtArray> {
+    let p = payload(data, "TickHasDebtArray", TICK_HAS_DEBT_PAYLOAD_LEN)?;
+    Ok(TickHasDebtArray { index: p[2], bits: bytes(p, 3) })
+}
+
+impl TickHasDebtArray {
+    fn first_tick(&self) -> i32 {
+        crate::tick::MIN_TICK + self.index as i32 * TICKS_PER_ARRAY
+    }
+
+    /// Highest tick in this array below `tick` that holds debt.
+    pub fn highest_below(&self, tick: i32) -> Option<i32> {
+        let first = self.first_tick();
+        let top = (tick - 1).min(first + TICKS_PER_ARRAY - 1);
+        (first..=top).rev().find(|t| {
+            let bit = (t - first) as usize;
+            self.bits[bit / 8] & (1 << (bit % 8)) != 0
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,12 +262,16 @@ pub(crate) mod tests {
         p[0..2].copy_from_slice(&5u16.to_le_bytes());
         p[6..8].copy_from_slice(&800u16.to_le_bytes());
         p[8..10].copy_from_slice(&850u16.to_le_bytes());
+        p[16..18].copy_from_slice(&25u16.to_le_bytes());
         p[18..50].copy_from_slice(&[1; 32]);
+        p[114..146].copy_from_slice(&[4; 32]);
         p[146..178].copy_from_slice(&[2; 32]);
         p[178..210].copy_from_slice(&[3; 32]);
         let cfg = parse_vault_config(&account("VaultConfig", &p)).unwrap();
         assert_eq!((cfg.vault_id, cfg.collateral_factor, cfg.liquidation_threshold), (5, 800, 850));
         assert_eq!(cfg.oracle, Pubkey::new_from_array([1; 32]));
+        assert_eq!(cfg.borrow_fee, 25);
+        assert_eq!(cfg.oracle_program, Pubkey::new_from_array([4; 32]));
         assert_eq!(cfg.supply_token, Pubkey::new_from_array([2; 32]));
         assert_eq!(cfg.borrow_token, Pubkey::new_from_array([3; 32]));
     }
@@ -207,6 +291,34 @@ pub(crate) mod tests {
             oracle.sources,
             vec![Pubkey::new_from_array([4; 32]), Pubkey::new_from_array([5; 32])]
         );
+    }
+
+    #[test]
+    fn parses_vault_state() {
+        let mut p = vec![0u8; VAULT_STATE_PAYLOAD_LEN];
+        p[2] = 1;
+        p[3..7].copy_from_slice(&(-120i32).to_le_bytes());
+        p[7..11].copy_from_slice(&4u32.to_le_bytes());
+        p[11..15].copy_from_slice(&9u32.to_le_bytes());
+        let s = parse_vault_state(&account("VaultState", &p)).unwrap();
+        assert!(s.branch_liquidated);
+        assert_eq!((s.topmost_tick, s.current_branch_id, s.total_branch_id), (-120, 4, 9));
+    }
+
+    #[test]
+    fn tick_has_debt_bitmap() {
+        assert_eq!(tick_has_debt_index(crate::tick::MIN_TICK), 0);
+        assert_eq!(tick_has_debt_index(0), 7);
+        assert_eq!(tick_has_debt_index(crate::tick::MAX_TICK), 15);
+        // Array 8 starts at tick 1; set ticks 1 and 300.
+        let mut p = vec![0u8; TICK_HAS_DEBT_PAYLOAD_LEN];
+        p[2] = 8;
+        p[3] |= 1; // tick 1: bit 0
+        p[3 + 299 / 8] |= 1 << (299 % 8); // tick 300
+        let a = parse_tick_has_debt(&account("TickHasDebtArray", &p)).unwrap();
+        assert_eq!(a.highest_below(5_000), Some(300));
+        assert_eq!(a.highest_below(300), Some(1));
+        assert_eq!(a.highest_below(1), None);
     }
 
     #[test]

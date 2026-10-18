@@ -327,7 +327,9 @@ mod tests {
             vault_id: 1,
             collateral_factor: 800,
             liquidation_threshold: 850,
+            borrow_fee: 0,
             oracle: Pubkey::new_unique(),
+            oracle_program: Pubkey::new_unique(),
             supply_token: "So11111111111111111111111111111111111111112".parse().unwrap(),
             borrow_token: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().unwrap(),
         }
