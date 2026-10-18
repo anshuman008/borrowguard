@@ -54,7 +54,7 @@ refresh reserves + obligation → flash-borrow USDC → repay debt
 | `crates/borrowguard-jupiter` | Jupiter Lend venue: Fluid vault layouts, exact tick math, live snapshots, `operate` / flash-loan builders, delever and relever execution. |
 | `crates/borrowguard-marginfi` | Project 0 (marginfi v2) venue: account and bank layouts, live snapshots from the risk engine's health cache. |
 | `crates/borrowguard-exec` | Execution plumbing shared by venues: Jupiter swaps, lookup tables, compose / simulate / send. |
-| `crates/borrowguard-cli` | The `borrowguard` binary: `fetch-prices`, `backtest`, `positions`, `monitor`, `watch`, `lookup-table`, `rebalance`. |
+| `crates/borrowguard-cli` | The `borrowguard` binary: `fetch-prices`, `backtest`, `positions`, `monitor`, `watch`, `lookup-table`, `rebalance`; timer, websocket or gRPC watching. |
 
 ## Venues
 
@@ -184,6 +184,38 @@ label = "jupiter sol/usdc"
 Unknown keys are rejected, so a typo like `traget` fails loudly instead of
 silently falling back to a default. Each line of output and each alert is
 prefixed with the position's label.
+
+### React faster: websocket or gRPC
+
+By default `monitor` and `watch` check on a timer. With `--stream`, each
+position also subscribes to its own account and its price feeds, and is
+re-checked as soon as one of them changes:
+
+| `--stream` | Needs | Reacts in | Good for |
+|---|---|---|---|
+| `poll` (default) | any RPC, even the public one | up to `interval_secs` | low leverage |
+| `websocket` | the RPC's websocket endpoint (most providers, free tiers too) | ~1 slot + `--min-check-ms` | most setups |
+| `grpc` | a Yellowstone gRPC endpoint (Helius LaserStream, Triton, …) and `--features grpc` | ~1 slot + `--min-check-ms` | high leverage, tight loops |
+
+```bash
+./target/release/borrowguard watch --stream websocket       # wss:// version of RPC_URL, or --ws-url
+
+cargo build --release --features grpc
+GRPC_URL=https://<endpoint> GRPC_TOKEN=<token> ./target/release/borrowguard watch --stream grpc
+```
+
+A position is re-checked at most once per `--min-check-ms` (default 1000):
+some price feeds update every slot, and each check is an RPC simulation. The
+timer keeps running as a heartbeat; between heartbeats only changes are
+printed, and each heartbeat line counts the re-checks since the last one. If
+the stream drops, BorrowGuard reconnects with backoff and keeps checking on
+the timer meanwhile; a permission error (for example a plan without gRPC)
+stops the stream and leaves the timer. Real gRPC run on a Kamino position:
+
+```
+watching kamino position 2iP8DH… every 20s + gRPC updates on 2 accounts, alerts: off
+21:31:14  SOL/USDC 101.4694  lev 1.797×  LTV 44.4%  ripcord@ 67.5242 (-33.5%)  liq@ 56.2702 (-44.5%)  → … · 18 re-checks on updates
+```
 
 ### Example: SOL, Oct 2025 → Oct 2026, 5-minute bars, 3× target
 
@@ -360,8 +392,9 @@ frozen fork doesn't receive.
    [Surfpool](https://github.com/txtx/surfpool) mainnet fork
 7. ✅ Executor for Jupiter Lend: the same, fork-tested on SOL/USDC,
    cbBTC/USDC and JitoSOL/SOL vaults
-8. ⬜ Mainnet with a small position; dry-run by default
-9. ⬜ Stretch: liquidator mode (same building blocks, other people's positions)
+8. ✅ Faster watching: websocket and Yellowstone gRPC streams
+9. ⬜ Mainnet with a small position; dry-run by default
+10. ⬜ Stretch: liquidator mode (same building blocks, other people's positions)
 
 ## Safety
 
