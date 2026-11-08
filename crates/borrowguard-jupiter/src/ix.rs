@@ -9,7 +9,9 @@ use solana_program::{
     system_program, sysvar,
 };
 
-use borrowguard_exec::token::{associated_token_address, ASSOCIATED_TOKEN_PROGRAM_ID};
+use borrowguard_exec::token::{
+    associated_token_address, ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID,
+};
 
 use crate::layout::discriminator;
 use crate::tick::MIN_TICK;
@@ -18,6 +20,8 @@ pub const VAULTS_PROGRAM_ID: Pubkey = pubkey!("jupr81YtYssSyPt8jbnGuiWon5f6x9TcD
 pub const LIQUIDITY_PROGRAM_ID: Pubkey = pubkey!("jupeiUmn818Jg1ekPURTpr4mFo29p46vygyykFJ3wZC");
 pub const ORACLE_PROGRAM_ID: Pubkey = pubkey!("jupnw4B6Eqs7ft6rxpzYLJZYSnrpRgPcr589n5Kv4oc");
 pub const FLASHLOAN_PROGRAM_ID: Pubkey = pubkey!("jupgfSgfuAXv4B6R2Uxu85Z1qdzgju79s6MfZekN6XS");
+/// Metaplex token metadata, which describes each position NFT.
+pub const METADATA_PROGRAM_ID: Pubkey = pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
 
 fn vault_pda(seeds: &[&[u8]]) -> Pubkey {
     Pubkey::find_program_address(seeds, &VAULTS_PROGRAM_ID).0
@@ -34,6 +38,11 @@ fn tick_seed(tick: i32) -> [u8; 4] {
 
 pub fn position_pda(vault_id: u16, nft_id: u32) -> Pubkey {
     vault_pda(&[b"position", &vault_id.to_le_bytes(), &nft_id.to_le_bytes()])
+}
+
+/// The NFT whose holder owns a position.
+pub fn position_mint_pda(vault_id: u16, nft_id: u32) -> Pubkey {
+    vault_pda(&[b"position_mint", &vault_id.to_le_bytes(), &nft_id.to_le_bytes()])
 }
 
 pub fn vault_config_pda(vault_id: u16) -> Pubkey {
@@ -197,6 +206,39 @@ pub fn operate(a: &OperateAccounts, new_col: i128, new_debt: i128) -> Instructio
     Instruction { program_id: VAULTS_PROGRAM_ID, accounts, data }
 }
 
+/// Create position `nft_id` (the vault's `next_position_id`) in `vault_id`
+/// and mint its NFT to the signer.
+pub fn init_position(signer: &Pubkey, vault_id: u16, nft_id: u32) -> Instruction {
+    let mint = position_mint_pda(vault_id, nft_id);
+    let metadata = Pubkey::find_program_address(
+        &[b"metadata", METADATA_PROGRAM_ID.as_ref(), mint.as_ref()],
+        &METADATA_PROGRAM_ID,
+    )
+    .0;
+    let mut data = discriminator("global", "init_position").to_vec();
+    data.extend_from_slice(&vault_id.to_le_bytes());
+    data.extend_from_slice(&nft_id.to_le_bytes());
+    Instruction {
+        program_id: VAULTS_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*signer, true),
+            AccountMeta::new_readonly(vault_pda(&[b"vault_admin"]), false),
+            AccountMeta::new(vault_state_pda(vault_id), false),
+            AccountMeta::new(position_pda(vault_id, nft_id), false),
+            AccountMeta::new(mint, false),
+            AccountMeta::new(associated_token_address(signer, &mint, &TOKEN_PROGRAM_ID), false),
+            AccountMeta::new(metadata, false),
+            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(sysvar::instructions::ID, false),
+            AccountMeta::new_readonly(METADATA_PROGRAM_ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+        ],
+        data,
+    }
+}
+
 /// Create a tick account (permissionless; the signer pays rent).
 pub fn init_tick(signer: &Pubkey, vault_id: u16, tick: i32) -> Instruction {
     let mut data = discriminator("global", "init_tick").to_vec();
@@ -309,6 +351,15 @@ mod tests {
             token.liquidity_vault().to_string(),
             "BmkUoKMFYBxNSzWXyUjyMJjMAaVz4d8ZnxwwmhDCUXFB"
         );
+    }
+
+    #[test]
+    fn init_position_matches_the_idl() {
+        let ix = init_position(&Pubkey::new_unique(), 1, 7);
+        assert_eq!(ix.data[..8], [197, 20, 10, 1, 97, 160, 177, 91]);
+        assert_eq!(ix.data[8..], [1, 0, 7, 0, 0, 0]);
+        assert_eq!(ix.accounts.len(), 13);
+        assert_eq!(ix.accounts[3].pubkey, position_pda(1, 7));
     }
 
     #[test]

@@ -114,6 +114,8 @@ pub struct VaultState {
     pub topmost_tick: i32,
     pub current_branch_id: u32,
     pub total_branch_id: u32,
+    /// NFT id the next `init_position` must use.
+    pub next_position_id: u32,
 }
 
 pub fn parse_vault_state(data: &[u8]) -> Result<VaultState> {
@@ -123,6 +125,7 @@ pub fn parse_vault_state(data: &[u8]) -> Result<VaultState> {
         topmost_tick: i32::from_le_bytes(bytes(p, 3)),
         current_branch_id: u32::from_le_bytes(bytes(p, 7)),
         total_branch_id: u32::from_le_bytes(bytes(p, 11)),
+        next_position_id: u32::from_le_bytes(bytes(p, 107)),
     })
 }
 
