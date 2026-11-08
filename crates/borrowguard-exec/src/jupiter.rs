@@ -117,6 +117,33 @@ impl Jupiter {
         })
     }
 
+    /// Exact-in quote selling as little `input` as needed for the guaranteed
+    /// output to reach `need`, starting from the estimate `sell`. One
+    /// re-quote corrects for the route's actual price. Fails past `max_sell`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quote_covering(
+        &self,
+        input: &Pubkey,
+        output: &Pubkey,
+        need: u64,
+        mut sell: u64,
+        max_sell: u64,
+        slippage_bps: u16,
+        max_accounts: u8,
+    ) -> Result<Quote> {
+        for _ in 0..3 {
+            if sell > max_sell {
+                bail!("selling {sell} of {max_sell} available still wouldn't cover {need}");
+            }
+            let quote = self.quote(input, output, sell, slippage_bps, max_accounts)?;
+            if quote.min_out >= need {
+                return Ok(quote);
+            }
+            sell = (sell as f64 * need as f64 / quote.min_out.max(1) as f64 * 1.002).ceil() as u64;
+        }
+        bail!("swap quotes kept moving; no quote covered {need}, retry")
+    }
+
     /// Instructions for `quote`, signed by `user`. Jupiter's compute-budget
     /// instructions are dropped: the composer sets its own.
     pub fn swap_instructions(&self, quote: &Quote, user: &Pubkey) -> Result<SwapIxs> {
