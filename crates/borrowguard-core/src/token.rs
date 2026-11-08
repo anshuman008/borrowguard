@@ -25,6 +25,11 @@ pub fn symbol(mint: &str) -> String {
         .map_or_else(|| format!("{}…", &mint[..4.min(mint.len())]), |(_, s)| s.to_string())
 }
 
+/// Mint (base58) for a common symbol, any case.
+pub fn mint(symbol: &str) -> Option<&'static str> {
+    KNOWN.iter().find(|(_, s)| s.eq_ignore_ascii_case(symbol)).map(|(m, _)| *m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,5 +38,11 @@ mod tests {
     fn known_and_unknown_mints() {
         assert_eq!(symbol("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"), "USDC");
         assert_eq!(symbol("11111111111111111111111111111111"), "1111…");
+    }
+
+    #[test]
+    fn mint_by_symbol() {
+        assert_eq!(mint("jitosol"), Some("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"));
+        assert_eq!(mint("NOPE"), None);
     }
 }
