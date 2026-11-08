@@ -58,7 +58,16 @@ impl Jupiter {
             Some(key) => req.header("x-api-key", key),
             None => req,
         };
-        let resp = req.send()?;
+        // The keyless API rate-limits bursts, and a close or rebalance makes
+        // a few calls in a row: back off briefly instead of failing.
+        let mut resp = req.try_clone().context("Jupiter request")?.send()?;
+        for wait in [1, 2, 4] {
+            if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(wait));
+            resp = req.try_clone().context("Jupiter request")?.send()?;
+        }
         let status = resp.status();
         let body: Value = resp.json().context("Jupiter returned non-JSON")?;
         if !status.is_success() || body.get("error").is_some() {
