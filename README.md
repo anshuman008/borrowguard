@@ -10,9 +10,10 @@ Kamino and Jupiter Lend) rebalances the position with a flash loan, in one
 transaction, from your own wallet.
 
 > **Status: early.** The controller core, backtester and live monitor (Kamino,
-> Jupiter Lend, Project 0 / marginfi) work. **Rebalancing in both directions**
-> (delever and relever) works on Kamino and Jupiter Lend, by hand or
-> automatically from `watch --live`, and is tested on a mainnet fork. It has
+> Jupiter Lend, Project 0 / marginfi) work. On Kamino and Jupiter Lend,
+> BorrowGuard **opens, rebalances and closes** positions from your wallet,
+> each in one flash-loan transaction, by hand or (rebalancing) automatically
+> from `watch --live`; the whole lifecycle is tested on a mainnet fork. It has
 > not been run with real money yet.
 
 ## How it works
@@ -50,18 +51,18 @@ refresh reserves + obligation → flash-borrow USDC → repay debt
 | Crate | What |
 |---|---|
 | `crates/borrowguard-core` | Position math, the controller and the `Venue` trait. No Solana deps; shared by backtester and bot. |
-| `crates/borrowguard-kamino` | Kamino Lend venue: klend account layouts, instruction builders, live snapshots, delever execution. |
-| `crates/borrowguard-jupiter` | Jupiter Lend venue: Fluid vault layouts, exact tick math, live snapshots, `operate` / flash-loan builders, delever and relever execution. |
+| `crates/borrowguard-kamino` | Kamino Lend venue: klend account layouts, instruction builders, live snapshots, open / rebalance / close execution. |
+| `crates/borrowguard-jupiter` | Jupiter Lend venue: Fluid vault layouts, exact tick math, live snapshots, `operate` / flash-loan builders, open / rebalance / close execution. |
 | `crates/borrowguard-marginfi` | Project 0 (marginfi v2) venue: account and bank layouts, live snapshots from the risk engine's health cache. |
 | `crates/borrowguard-exec` | Execution plumbing shared by venues: Jupiter swaps, lookup tables, compose / simulate / send. |
-| `crates/borrowguard-cli` | The `borrowguard` binary: `fetch-prices`, `backtest`, `positions`, `monitor`, `watch`, `lookup-table`, `rebalance`; timer, websocket or gRPC watching. |
+| `crates/borrowguard-cli` | The `borrowguard` binary: `fetch-prices`, `backtest`, `positions`, `monitor`, `watch`, `open`, `rebalance`, `close`, `lookup-table`; timer, websocket or gRPC watching. |
 
 ## Venues
 
 | Venue | Status |
 |---|---|
-| Kamino Lend | ✅ monitor · ✅ delever + relever, manual or automatic (fork-tested) |
-| Jupiter Lend | ✅ monitor · ✅ delever + relever, manual or automatic (fork-tested) |
+| Kamino Lend | ✅ monitor · ✅ open + close · ✅ delever + relever, manual or automatic (fork-tested) |
+| Jupiter Lend | ✅ monitor · ✅ open + close · ✅ delever + relever, manual or automatic (fork-tested) |
 | Project 0 / marginfi | ✅ monitor |
 | Save | planned |
 
@@ -258,6 +259,44 @@ for details.
 - Trades fill at the bar close with a fixed cost in bps. The live bot will use
   real swap quotes.
 
+## Open and close a position
+
+No lending UI needed: `open` turns collateral in your wallet into a levered
+position in one transaction, and `close` unwinds it in one.
+
+```
+open:   flash-borrow USDC → Jupiter swap USDC → SOL → deposit your SOL + the swap's
+        → borrow USDC (flash loan + fee) → flash-repay
+close:  flash-borrow USDC → repay all debt → withdraw all SOL
+        → Jupiter swap just enough SOL → USDC → flash-repay
+```
+
+```bash
+# Kamino (main market by default; --market for another): tokens by symbol or mint
+./target/release/borrowguard open --venue kamino --collateral SOL --debt USDC \
+    --deposit 1 --leverage 2 --keypair ~/.config/solana/borrowguard.json --send
+
+# Jupiter Lend: the vault fixes the pair
+./target/release/borrowguard open --venue jupiter --vault 1 --deposit 1 --leverage 2 ... --send
+
+# Close: repay everything; the rest of the collateral comes back to the wallet
+./target/release/borrowguard close --position <POSITION> --lookup-table <TABLE> ... --send
+```
+
+The first `open` sends a setup transaction (Kamino: klend user metadata, a
+plain obligation, farm states; Jupiter Lend: the position and its NFT) and
+creates the position's lookup table, then opens. It prints the position, its
+leverage and a `borrowguard.toml` entry to guard it. On Kamino the setup costs
+about 0.05 SOL of rent: the obligation (0.024, refunded when `close` empties
+it), user metadata (0.008), a farm state per farmed reserve (0.007), the
+lookup table (0.007) and token accounts (0.002 each). Later opens reuse them.
+Without `--send` both commands only simulate; `open` stops after simulating
+the setup, since the open transaction needs it on-chain.
+
+`open` checks the leverage against the reserve's or vault's max LTV. Kamino
+elevation groups (e.g. high-leverage LST/SOL loops) aren't supported by `open`
+yet.
+
 ## Rebalance a position
 
 Each rebalance is one atomic transaction, funded by a flash loan from the same
@@ -346,7 +385,31 @@ controller  target 1.4× band ±0.1 ripcord 2.5× (AUTO-REBALANCE LIVE: trades a
 ### Test on a mainnet fork first
 
 [Surfpool](https://github.com/txtx/surfpool) runs a local copy of mainnet with
-fake money. The test script takes a real Kamino obligation or Jupiter Lend
+fake money. The lifecycle script gives a throwaway keypair 10 SOL, then opens a
+position, relevers it, delevers it and closes it, all with `--send`:
+
+```bash
+surfpool start -u "$RPC_URL" --no-tui --no-deploy        # another terminal
+RPC_URL=... python3 scripts/fork_lifecycle_test.py kamino --collateral SOL --debt USDC
+RPC_URL=... python3 scripts/fork_lifecycle_test.py jupiter --vault 1
+```
+
+Kamino SOL/USDC:
+
+```
+PASS open: 2.006× (asked 2×)
+PASS rebalance: 2.502× (target 2.5×)
+PASS rebalance: 1.503× (target 1.5×)
+PASS close: position empty
+wallet: 9.965841 SOL (started with 10)
+```
+
+It passes on Kamino SOL/USDC and cbBTC/USDC and Jupiter Lend SOL/USDC. Use
+a freshly started fork, one run or two per fork: Surfpool's clock runs ahead
+of real time as the script catches its slots up to mainnet, until every price
+looks stale.
+
+The rebalance script takes a real Kamino obligation or Jupiter Lend
 position, hands it to a throwaway keypair inside the fork, relevers it up and
 delevers it back down:
 
@@ -393,15 +456,16 @@ frozen fork doesn't receive.
 7. ✅ Executor for Jupiter Lend: the same, fork-tested on SOL/USDC,
    cbBTC/USDC and JitoSOL/SOL vaults
 8. ✅ Faster watching: websocket and Yellowstone gRPC streams
-9. ⬜ Mainnet with a small position; dry-run by default
-10. ⬜ Stretch: liquidator mode (same building blocks, other people's positions)
+9. ✅ `open` and `close` from the CLI, each one flash-loan transaction
+10. ⬜ Mainnet with a small position; dry-run by default
+11. ⬜ Stretch: liquidator mode (same building blocks, other people's positions)
 
 ## Safety
 
 - Use a dedicated wallet that holds only the position you want guarded.
 - Keep the signing keypair in a file outside the repo; `.env` and `*.keypair.json`
   are gitignored.
-- `rebalance` only simulates unless you pass `--send`; `watch` only simulates
+- `open`, `rebalance` and `close` only simulate unless you pass `--send`; `watch` only simulates
   unless a position has `execute = true` **and** you pass `--live`. Every
   transaction is simulated before it is sent. `touch STOP` pauses all trading.
 - Test on a Surfpool fork before trusting it with real money.
