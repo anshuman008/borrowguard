@@ -499,6 +499,9 @@ mod tests {
             self.0.set(self.0.get() + 1);
             Ok(Executed::Sent { signature: "sig".into(), summary: "bought".into() })
         }
+        fn close(&self, _: &ExecContext) -> Result<Executed> {
+            unreachable!("the watch loop never closes positions")
+        }
         fn static_accounts(
             &self,
             _: &borrowguard_kamino::Pubkey,

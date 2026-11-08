@@ -6,6 +6,8 @@
 //!          → swap collateral→debt → flash payback
 //! relever: flash-borrow debt → swap debt→collateral
 //!          → operate(deposit collateral, borrow debt) → flash payback
+//! close:   flash-borrow debt → operate(withdraw all, pay back all)
+//!          → swap part of the collateral→debt → flash payback
 //! ```
 //!
 //! `operate` must be handed the tick the position lands in, which depends on
@@ -16,7 +18,10 @@ use std::collections::HashSet;
 
 use anyhow::{bail, ensure, Context, Result};
 use borrowguard_core::Snapshot;
-use borrowguard_exec::{token::create_ata_idempotent, ExecContext, Execute, Executed};
+use borrowguard_exec::{
+    token::{create_ata_idempotent, unwrap_sol, NATIVE_MINT},
+    ExecContext, Execute, Executed,
+};
 use solana_program::{instruction::Instruction, pubkey::Pubkey, system_program, sysvar};
 use solana_sdk::signer::Signer;
 
@@ -29,7 +34,13 @@ use crate::tick::{self, MIN_TICK};
 use crate::{snapshot_from, JupiterVenue, Reading};
 
 /// Route size cap so the swap fits beside `operate` and the flash loan.
-const MAX_SWAP_ACCOUNTS: u8 = 20;
+pub(crate) const MAX_SWAP_ACCOUNTS: u8 = 20;
+/// `operate` amount meaning all of it: withdraw every bit of collateral, or
+/// pay back every bit of debt.
+pub const ALL: i128 = i128::MIN;
+/// Close flash-borrows this much more than the debt last seen, so interest
+/// accrued until the transaction lands is covered; the rest stays in the wallet.
+const CLOSE_DEBT_MARGIN: f64 = 1e-4;
 /// The flashloan program rejects smaller loans.
 const MIN_FLASHLOAN: u64 = 1_000;
 const EXCHANGE_PRICES_PRECISION: u128 = 1_000_000_000_000;
@@ -37,7 +48,7 @@ const FOUR_DECIMALS: u128 = 10_000;
 /// Highest `TickHasDebtArray` index.
 const MAX_ARRAY_INDEX: u8 = 15;
 
-fn flash_fee(amount: u64, fee_bps: u16) -> u64 {
+pub(crate) fn flash_fee(amount: u64, fee_bps: u16) -> u64 {
     (amount as u128 * fee_bps as u128).div_ceil(FOUR_DECIMALS) as u64
 }
 
@@ -104,7 +115,8 @@ pub struct Prices {
 }
 
 /// A position's raw collateral and net debt after `operate(new_col, new_debt)`,
-/// amounts already scaled to 9 decimals. Port of `Position::get_new_position_info`.
+/// amounts already scaled to 9 decimals ([`ALL`] passes through unscaled).
+/// Port of `Position::get_new_position_info`.
 pub fn apply_operate(
     col_raw: u128,
     debt_raw: u128,
@@ -113,14 +125,18 @@ pub fn apply_operate(
     p: Prices,
 ) -> Result<(u128, u128)> {
     let mut col = col_raw;
-    if new_col > 0 {
+    if new_col == ALL {
+        col = 0;
+    } else if new_col > 0 {
         col += new_col as u128 * EXCHANGE_PRICES_PRECISION / p.supply_ex;
     } else if new_col < 0 {
         let withdraw = (new_col.unsigned_abs() * EXCHANGE_PRICES_PRECISION).div_ceil(p.supply_ex);
         col = col.checked_sub(withdraw).context("withdrawal exceeds collateral")?;
     }
     let mut debt = debt_raw;
-    if new_debt > 0 {
+    if new_debt == ALL {
+        debt = 0;
+    } else if new_debt > 0 {
         let borrow = (new_debt as u128 * EXCHANGE_PRICES_PRECISION).div_ceil(p.borrow_ex);
         debt += borrow + (borrow * p.borrow_fee as u128).div_ceil(FOUR_DECIMALS);
     } else if new_debt < 0 {
@@ -133,32 +149,55 @@ pub fn apply_operate(
 /// The vault keeps amounts with 9 decimals.
 fn scale(amount: i128, decimals: u8) -> Result<i128> {
     ensure!(decimals <= 9, "tokens with more than 9 decimals aren't supported");
+    if amount == ALL {
+        return Ok(ALL);
+    }
     Ok(amount * 10i128.pow(9 - decimals as u32))
 }
 
-fn base_units(tokens: f64, decimals: u8) -> u64 {
+pub(crate) fn base_units(tokens: f64, decimals: u8) -> u64 {
     (tokens * 10f64.powi(decimals as i32)).floor() as u64
 }
 
-fn scale_down(raw: u64, decimals: u8) -> f64 {
+pub(crate) fn scale_down(raw: u64, decimals: u8) -> f64 {
     raw as f64 / 10f64.powi(decimals as i32)
 }
 
-/// Position state a rebalance needs, read fresh.
-struct Loaded {
-    r: Reading,
+/// Position state an `operate` needs, read fresh.
+pub(crate) struct Loaded {
+    pub(crate) r: Reading,
     position_token_account: Pubkey,
-    supply: Token,
-    borrow: Token,
+    pub(crate) supply: Token,
+    pub(crate) borrow: Token,
     state: VaultState,
     /// The vault's own address lookup table.
-    vault_table: Option<Pubkey>,
-    flash_fee_bps: u16,
-    snap: Snapshot,
+    pub(crate) vault_table: Option<Pubkey>,
+    pub(crate) flash_fee_bps: u16,
+}
+
+impl Loaded {
+    fn snapshot(&self) -> Result<Snapshot> {
+        let r = &self.r;
+        snapshot_from(&r.pos, &r.config, r.supply_ex, r.borrow_ex, r.rate, r.slot)
+    }
+
+    /// Where the position sits: its tick, the tick-id count its liquidation
+    /// history is keyed by, raw collateral and raw net debt. A position
+    /// without debt sits at the bottom tick.
+    fn current(&self) -> Result<(i32, u32, u128, u128)> {
+        let pos = &self.r.pos;
+        if pos.supply_only {
+            return Ok((MIN_TICK, 0, pos.supply_raw as u128, 0));
+        }
+        let net_debt = tick::debt_raw(pos.supply_raw, pos.tick)?
+            .checked_sub(pos.dust_debt_raw as u128)
+            .context("dust debt exceeds position debt")?;
+        Ok((pos.tick, self.r.tick.total_ids, pos.supply_raw as u128, net_debt))
+    }
 }
 
 impl JupiterVenue {
-    fn load(&self, owner: &Pubkey) -> Result<Loaded> {
+    pub(crate) fn load(&self, owner: &Pubkey) -> Result<Loaded> {
         let r = self.read()?;
         let vault = r.pos.vault_id;
         let keys = [
@@ -187,7 +226,6 @@ impl JupiterVenue {
             "signer {owner} doesn't hold this position's NFT"
         );
 
-        let snap = snapshot_from(&r.pos, &r.config, r.supply_ex, r.borrow_ex, r.rate, r.slot)?;
         Ok(Loaded {
             position_token_account: nft_account,
             supply,
@@ -195,42 +233,40 @@ impl JupiterVenue {
             state: parse_vault_state(&get(3)?.data)?,
             vault_table: get(4).ok().and_then(|a| parse_vault_metadata(&a.data).ok()),
             flash_fee_bps: parse_flashloan_fee(&get(5)?.data)?,
-            snap,
             r,
         })
     }
 
     /// The `operate` instruction for these amounts (token base units), and the
     /// instructions that create any tick / branch accounts it needs first.
-    fn plan_operate(
+    pub(crate) fn plan_operate(
         &self,
         owner: &Pubkey,
         l: &Loaded,
         new_col: i128,
         new_debt: i128,
     ) -> Result<(Vec<Instruction>, Instruction)> {
-        let pos = &l.r.pos;
-        let vault = pos.vault_id;
-        let net_debt = tick::debt_raw(pos.supply_raw, pos.tick)?
-            .checked_sub(pos.dust_debt_raw as u128)
-            .context("dust debt exceeds position debt")?;
+        let vault = l.r.pos.vault_id;
+        let (current_tick, current_ids, col_raw, net_debt) = l.current()?;
         let prices = Prices {
             supply_ex: l.r.supply_ex,
             borrow_ex: l.r.borrow_ex,
             borrow_fee: l.r.config.borrow_fee,
         };
         let (col, debt) = apply_operate(
-            pos.supply_raw as u128,
+            col_raw,
             net_debt,
             scale(new_col, l.supply.decimals)?,
             scale(new_debt, l.borrow.decimals)?,
             prices,
         )?;
-        ensure!(debt > 0, "operate would clear the debt; close the position instead");
-        let final_tick = tick::position_tick(col, tick::scaled_debt(debt))?;
+        let final_tick = if col == 0 || debt == 0 {
+            MIN_TICK
+        } else {
+            tick::position_tick(col, tick::scaled_debt(debt))?
+        };
 
         // Which tick / branch accounts exist decides what to create first.
-        let current_ids = l.r.tick.total_ids;
         let final_tick_key = ix::tick_pda(vault, final_tick);
         let new_branch_id = if l.state.branch_liquidated {
             l.state.total_branch_id + 1
@@ -241,10 +277,15 @@ impl JupiterVenue {
             final_tick_key,
             ix::branch_pda(vault, new_branch_id),
             ix::branch_pda(vault, l.state.current_branch_id),
+            ix::tick_pda(vault, current_tick),
         ];
         let found = self.rpc.get_multiple_accounts(&probe)?;
         let mut inits = Vec::new();
-        let final_ids = match (final_tick == pos.tick, &found[0]) {
+        if found[3].is_none() {
+            // A new position starts at the bottom tick, which may not exist yet.
+            inits.push(ix::init_tick(owner, vault, current_tick));
+        }
+        let final_ids = match (final_tick == current_tick, &found[0]) {
             (true, _) => current_ids,
             (false, Some(a)) => parse_tick(&a.data)?.total_ids,
             (false, None) => {
@@ -252,10 +293,10 @@ impl JupiterVenue {
                 0
             }
         };
-        let current_tick_id = ix::tick_id_liquidation_pda(vault, pos.tick, current_ids);
+        let current_tick_id = ix::tick_id_liquidation_pda(vault, current_tick, current_ids);
         let final_tick_id = ix::tick_id_liquidation_pda(vault, final_tick, final_ids);
         let ids =
-            [(current_tick_id, pos.tick, current_ids), (final_tick_id, final_tick, final_ids)];
+            [(current_tick_id, current_tick, current_ids), (final_tick_id, final_tick, final_ids)];
         let ids_found = self.rpc.get_multiple_accounts(&[current_tick_id, final_tick_id])?;
         for (i, (key, tick, total_ids)) in ids.iter().enumerate() {
             if ids_found[i].is_none() && (i == 0 || *key != current_tick_id) {
@@ -281,14 +322,19 @@ impl JupiterVenue {
                 borrow: l.borrow,
                 position: self.position,
                 position_token_account: l.position_token_account,
-                current_tick: pos.tick,
+                current_tick,
                 current_tick_id,
                 final_tick,
                 final_tick_id,
                 new_branch: probe[1],
                 oracle_sources: l.r.oracle.sources.clone(),
                 branches,
-                tick_has_debt: self.tick_has_debt_arrays(vault, pos.tick, final_tick, &l.state)?,
+                tick_has_debt: self.tick_has_debt_arrays(
+                    vault,
+                    current_tick,
+                    final_tick,
+                    &l.state,
+                )?,
             },
             new_col,
             new_debt,
@@ -329,7 +375,7 @@ impl JupiterVenue {
     }
 
     /// Create the owner's token accounts only when missing.
-    fn missing_atas(&self, owner: &Pubkey, l: &Loaded) -> Result<Vec<Instruction>> {
+    pub(crate) fn missing_atas(&self, owner: &Pubkey, l: &Loaded) -> Result<Vec<Instruction>> {
         let tokens = [l.supply, l.borrow];
         let atas: Vec<Pubkey> = tokens.iter().map(|t| t.ata(owner)).collect();
         let existing = self.rpc.get_multiple_accounts(&atas)?;
@@ -346,11 +392,12 @@ impl Execute for JupiterVenue {
     fn delever(&self, ctx: &ExecContext, sell: f64, ripcord: bool) -> Result<Executed> {
         let owner = ctx.signer.pubkey();
         let l = self.load(&owner)?;
-        let sell_tokens = sell / l.snap.price();
+        let snap = l.snapshot()?;
+        let sell_tokens = sell / snap.price();
         ensure!(
-            sell_tokens > 0.0 && sell_tokens < l.snap.collateral,
+            sell_tokens > 0.0 && sell_tokens < snap.collateral,
             "can't sell {sell_tokens} of {} collateral",
-            l.snap.collateral
+            snap.collateral
         );
         let sell_raw = base_units(sell_tokens, l.supply.decimals);
         let slippage = if ripcord { ctx.ripcord_slippage_bps } else { ctx.slippage_bps };
@@ -361,7 +408,7 @@ impl Execute for JupiterVenue {
             slippage,
             MAX_SWAP_ACCOUNTS,
         )?;
-        let debt_raw = base_units(l.snap.debt, l.borrow.decimals);
+        let debt_raw = base_units(snap.debt, l.borrow.decimals);
         let amounts = size_delever(sell_raw, quote.min_out, debt_raw, l.flash_fee_bps)?;
         let swap = ctx.jupiter.swap_instructions(&quote, &owner)?;
         let (inits, operate) =
@@ -377,7 +424,7 @@ impl Execute for JupiterVenue {
         ixs.push(ix::flashloan_payback(&owner, &l.borrow, amounts.flash));
 
         let tables: Vec<Pubkey> = swap.lookup_tables.iter().copied().chain(l.vault_table).collect();
-        let (coll_sym, debt_sym) = (&l.snap.collateral_symbol, &l.snap.debt_symbol);
+        let (coll_sym, debt_sym) = (&snap.collateral_symbol, &snap.debt_symbol);
         ctx.run(&ixs, &tables, |units| {
             format!(
                 "{}sell {:.6} {coll_sym} → ≥{:.4} {debt_sym} (quote {:.4}, impact {:.3}%), repay {:.4} {debt_sym}, {units} CU",
@@ -394,6 +441,7 @@ impl Execute for JupiterVenue {
     fn relever(&self, ctx: &ExecContext, borrow: f64) -> Result<Executed> {
         let owner = ctx.signer.pubkey();
         let l = self.load(&owner)?;
+        let snap = l.snapshot()?;
         let flash_raw = base_units(borrow, l.borrow.decimals);
         let quote = ctx.jupiter.quote(
             &l.borrow.mint,
@@ -417,7 +465,7 @@ impl Execute for JupiterVenue {
         ixs.push(ix::flashloan_payback(&owner, &l.borrow, amounts.flash));
 
         let tables: Vec<Pubkey> = swap.lookup_tables.iter().copied().chain(l.vault_table).collect();
-        let (coll_sym, debt_sym) = (&l.snap.collateral_symbol, &l.snap.debt_symbol);
+        let (coll_sym, debt_sym) = (&snap.collateral_symbol, &snap.debt_symbol);
         ctx.run(&ixs, &tables, |units| {
             format!(
                 "borrow {:.4} {debt_sym} → ≥{:.6} {coll_sym} (quote {:.6}, impact {:.3}%), deposit {:.6} {coll_sym}, {units} CU",
@@ -426,6 +474,59 @@ impl Execute for JupiterVenue {
                 scale_down(quote.out_amount, l.supply.decimals),
                 quote.price_impact_pct * 100.0,
                 scale_down(amounts.deposit, l.supply.decimals),
+            )
+        })
+    }
+
+    fn close(&self, ctx: &ExecContext) -> Result<Executed> {
+        let owner = ctx.signer.pubkey();
+        let l = self.load(&owner)?;
+        let snap = l.snapshot()?;
+        let flash = (snap.debt * (1.0 + CLOSE_DEBT_MARGIN) * 10f64.powi(l.borrow.decimals as i32))
+            .ceil() as u64
+            + 2;
+        let need = flash + flash_fee(flash, l.flash_fee_bps);
+        // Withdrawing everything can come out a unit short of the snapshot.
+        let coll_raw = base_units(snap.collateral, l.supply.decimals).saturating_sub(2);
+        let estimate = (scale_down(need, l.borrow.decimals) / snap.price()
+            * (1.0 + ctx.slippage_bps as f64 / 10_000.0 + 0.002)
+            * 10f64.powi(l.supply.decimals as i32))
+        .ceil() as u64;
+        let quote = ctx.jupiter.quote_covering(
+            &l.supply.mint,
+            &l.borrow.mint,
+            need,
+            estimate,
+            coll_raw,
+            ctx.slippage_bps,
+            MAX_SWAP_ACCOUNTS,
+        )?;
+        let swap = ctx.jupiter.swap_instructions(&quote, &owner)?;
+        let (inits, operate) = self.plan_operate(&owner, &l, ALL, ALL)?;
+
+        let mut ixs = self.missing_atas(&owner, &l)?;
+        ixs.extend(inits);
+        ixs.push(ix::flashloan_borrow(&owner, &l.borrow, flash));
+        ixs.push(operate);
+        ixs.extend(swap.setup);
+        ixs.push(swap.swap);
+        ixs.extend(swap.cleanup);
+        ixs.push(ix::flashloan_payback(&owner, &l.borrow, flash));
+        if l.supply.mint == NATIVE_MINT || l.borrow.mint == NATIVE_MINT {
+            ixs.push(unwrap_sol(&owner));
+        }
+
+        let tables: Vec<Pubkey> = swap.lookup_tables.iter().copied().chain(l.vault_table).collect();
+        let (coll_sym, debt_sym) = (&snap.collateral_symbol, &snap.debt_symbol);
+        let sold = scale_down(quote.in_amount, l.supply.decimals);
+        ctx.run(&ixs, &tables, |units| {
+            format!(
+                "repay {:.4} {debt_sym}, withdraw {:.6} {coll_sym}, sell {sold:.6} {coll_sym} → ≥{:.4} {debt_sym} (impact {:.3}%), keep ~{:.6} {coll_sym}, {units} CU",
+                snap.debt,
+                snap.collateral,
+                scale_down(quote.min_out, l.borrow.decimals),
+                quote.price_impact_pct * 100.0,
+                snap.collateral - sold,
             )
         })
     }

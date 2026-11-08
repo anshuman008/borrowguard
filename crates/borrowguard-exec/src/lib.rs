@@ -91,6 +91,11 @@ pub trait Execute {
     /// atomically, funded by a flash loan.
     fn relever(&self, ctx: &ExecContext, borrow: f64) -> Result<Executed>;
 
+    /// Repay all debt and withdraw all collateral, atomically, funded by a
+    /// flash loan repaid by selling part of the collateral. The rest of the
+    /// collateral (and any spare debt token) ends up in the wallet.
+    fn close(&self, ctx: &ExecContext) -> Result<Executed>;
+
     /// Accounts that every rebalance of this position touches; worth putting
     /// in an address lookup table so the swap route has room.
     fn static_accounts(&self, owner: &Pubkey) -> Result<Vec<Pubkey>>;

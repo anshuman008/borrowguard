@@ -54,6 +54,24 @@ enum Cmd {
     /// Create an address lookup table with a position's accounts (one-time,
     /// ~0.004 SOL rent). Rebalances need it to fit a swap route.
     LookupTable(LookupTableArgs),
+    /// Close a Kamino or Jupiter Lend position in one flash-loan transaction:
+    /// repay all debt with part of the collateral, withdraw the rest to the
+    /// wallet. Simulates only unless --send is given.
+    Close(CloseArgs),
+}
+
+#[derive(Args)]
+struct CloseArgs {
+    /// Kamino obligation or Jupiter Lend position to close; the keypair must own it.
+    #[arg(long, alias = "obligation")]
+    position: Pubkey,
+    /// Owner's Solana keypair file (JSON), kept outside the repo.
+    #[arg(long, env = "BORROWGUARD_KEYPAIR")]
+    keypair: PathBuf,
+    #[command(flatten)]
+    rpc: RpcArgs,
+    #[command(flatten)]
+    exec: ExecArgs,
 }
 
 #[derive(Args)]
@@ -392,6 +410,7 @@ fn main() -> Result<()> {
         Cmd::Watch(args) => run_watch(args),
         Cmd::Rebalance(args) => run_rebalance(args),
         Cmd::LookupTable(args) => run_lookup_table(args),
+        Cmd::Close(args) => run_close(args),
     }
 }
 
@@ -842,6 +861,35 @@ fn run_lookup_table(args: LookupTableArgs) -> Result<()> {
         borrowguard_exec::tx::create_lookup_table(&rpc, &signer, &addresses, args.priority_fee)?;
     println!("lookup table: {table}\nuse it with: --lookup-table {table}");
     Ok(())
+}
+
+fn run_close(args: CloseArgs) -> Result<()> {
+    let signer = load_keypair(&args.keypair)?;
+    let owner = solana_sdk::signer::Signer::pubkey(&signer);
+    let rpc_url = &args.rpc.rpc_url;
+    let venue = open_rebalancer(rpc_url, args.position, owner)?;
+    let snap = venue.snapshot()?;
+    let lev = snap.position().leverage(snap.price()).unwrap_or(f64::INFINITY);
+    println!(
+        "{:.6} {} against {:.4} {} at {lev:.3}×: closing{}",
+        snap.collateral,
+        snap.collateral_symbol,
+        snap.debt,
+        snap.debt_symbol,
+        if args.exec.send { "" } else { " (simulation only; add --send to execute)" }
+    );
+    let ctx = args.exec.context(rpc_url, signer);
+    print_executed("close", &venue.close(&ctx)?);
+    Ok(())
+}
+
+fn print_executed(step: &str, done: &Executed) {
+    match done {
+        Executed::Simulated { summary, .. } => println!("{step}: simulated ok: {summary}"),
+        Executed::Sent { signature, summary } => {
+            println!("{step}: sent: {summary}\n  signature: {signature}")
+        }
+    }
 }
 
 fn channels(notifier: &Notifier) -> String {
