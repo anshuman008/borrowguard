@@ -13,8 +13,9 @@ transaction, from your own wallet.
 > Jupiter Lend, Project 0 / marginfi) work. On Kamino and Jupiter Lend,
 > BorrowGuard **opens, rebalances and closes** positions from your wallet,
 > each in one flash-loan transaction, by hand or (rebalancing) automatically
-> from `watch --live`; the whole lifecycle is tested on a mainnet fork. It has
-> not been run with real money yet.
+> from `watch --live`. The whole lifecycle is tested on a mainnet fork and has
+> run once on mainnet with real money (Kamino SOL/USDC: open at 1.5×, relever
+> to 2×, close). Still early: use small amounts.
 
 ## How it works
 
@@ -286,10 +287,16 @@ close:  flash-borrow USDC → repay all debt → withdraw all SOL
 The first `open` sends a setup transaction (Kamino: klend user metadata, a
 plain obligation, farm states; Jupiter Lend: the position and its NFT) and
 creates the position's lookup table, then opens. It prints the position, its
-leverage and a `borrowguard.toml` entry to guard it. On Kamino the setup costs
-about 0.05 SOL of rent: the obligation (0.024, refunded when `close` empties
-it), user metadata (0.008), a farm state per farmed reserve (0.007), the
-lookup table (0.007) and token accounts (0.002 each). Later opens reuse them.
+leverage and a `borrowguard.toml` entry to guard it. On mainnet the first
+Kamino SOL/USDC open cost 0.037 SOL of rent: the obligation (0.018, refunded
+when `close` empties it), user metadata (0.006), a farm state (0.005), the
+lookup table (0.005) and token accounts (0.0015 each). Later opens reuse them.
+
+The mainnet test (0.3 SOL: open at 1.5×, relever to 2×, close) ended with
+0.3796 SOL + 0.16 USDC from 0.4 SOL. Of the difference, 0.018 SOL is rent
+still held by those accounts; the three swaps and seven transactions cost
+about 0.0007 SOL. `close` keeps a little of the debt token: it sells enough
+collateral to cover the debt even at the worst allowed slippage.
 Without `--send` both commands only simulate; `open` stops after simulating
 the setup, since the open transaction needs it on-chain.
 
@@ -457,7 +464,7 @@ frozen fork doesn't receive.
    cbBTC/USDC and JitoSOL/SOL vaults
 8. ✅ Faster watching: websocket and Yellowstone gRPC streams
 9. ✅ `open` and `close` from the CLI, each one flash-loan transaction
-10. ⬜ Mainnet with a small position; dry-run by default
+10. ✅ Mainnet with a small position: Kamino SOL/USDC open, relever, close
 11. ⬜ Stretch: liquidator mode (same building blocks, other people's positions)
 
 ## Safety
