@@ -92,7 +92,10 @@ pub fn create_lookup_table(
 ) -> Result<Pubkey> {
     use solana_sdk::address_lookup_table::instruction::{create_lookup_table, extend_lookup_table};
     let me = signer.pubkey();
-    let slot = rpc.get_slot()?;
+    // The table's address comes from a slot that must already be in the
+    // SlotHashes sysvar of the bank checking the transaction. The confirmed
+    // slot isn't yet in its own bank's list; a finalized one always is.
+    let slot = rpc.get_slot_with_commitment(CommitmentConfig::finalized())?;
     let (create, table) = create_lookup_table(me, me, slot);
     // ~20 addresses per extend keeps each transaction well under the size cap.
     let mut batches = addresses.chunks(20);
