@@ -40,6 +40,7 @@ use crate::layout::{
 
 pub use crate::ix::{position_pda, LIQUIDITY_PROGRAM_ID, ORACLE_PROGRAM_ID, VAULTS_PROGRAM_ID};
 use crate::ix::{tick_pda, token_reserve_pda, vault_config_pda, vault_state_pda};
+use crate::tick::MIN_TICK;
 
 /// Vault amounts are scaled to 9 decimals regardless of the token's own.
 const AMOUNT_SCALE: f64 = 1e9;
@@ -133,21 +134,29 @@ impl JupiterVenue {
             format!("fetch position {} (closed, or not a mainnet address?)", self.position)
         })?;
         let pos = parse_position(&data)?;
-        ensure!(!pos.supply_only, "position has no debt (supply only), nothing to guard");
-
-        let keys = [vault_config_pda(pos.vault_id), tick_pda(pos.vault_id, pos.tick)];
+        // A position without debt sits below every tick, as if at the bottom
+        // one with no liquidation history.
+        let tick_key = (!pos.supply_only).then(|| tick_pda(pos.vault_id, pos.tick));
+        let keys: Vec<Pubkey> =
+            std::iter::once(vault_config_pda(pos.vault_id)).chain(tick_key).collect();
         let mut accounts = self.rpc.get_multiple_accounts(&keys)?.into_iter();
         let mut next = |what: &str| {
             accounts.next().flatten().map(|a| a.data).with_context(|| format!("{what} not found"))
         };
         let config = parse_vault_config(&next("vault config")?)?;
-        let tick = parse_tick(&next("position tick")?)?;
-        // The vault program rebuilds a liquidated position from branch
-        // history; we don't, so refuse rather than show stale numbers.
-        ensure!(
-            !tick.is_liquidated && tick.total_ids <= pos.tick_id,
-            "position's tick was liquidated since it was opened; its debt can't be read from the position alone"
-        );
+        let tick = match tick_key {
+            None => Tick { tick: MIN_TICK, is_liquidated: false, total_ids: 0 },
+            Some(_) => {
+                let tick = parse_tick(&next("position tick")?)?;
+                // The vault program rebuilds a liquidated position from branch
+                // history; we don't, so refuse rather than show stale numbers.
+                ensure!(
+                    !tick.is_liquidated && tick.total_ids <= pos.tick_id,
+                    "position's tick was liquidated since it was opened; its debt can't be read from the position alone"
+                );
+                tick
+            }
+        };
         let oracle = parse_oracle(&self.rpc.get_account_data(&config.oracle)?)?;
         let payer = match self.payer.get() {
             Some(payer) => *payer,
@@ -227,6 +236,7 @@ pub fn snapshot_from(
     rate: u128,
     slot: u64,
 ) -> Result<Snapshot> {
+    ensure!(!pos.supply_only, "position has no debt (supply only), nothing to guard");
     let net_debt_raw = tick::debt_raw(pos.supply_raw, pos.tick)?
         .checked_sub(pos.dust_debt_raw as u128)
         .context("dust debt exceeds position debt")?;
