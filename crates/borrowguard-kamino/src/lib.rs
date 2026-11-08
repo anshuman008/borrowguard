@@ -29,10 +29,12 @@ use crate::layout::{
     parse_obligation, Obligation, ObligationCollateral, ObligationLiquidity,
     OBLIGATION_ACCOUNT_LEN, OBLIGATION_OWNER_OFFSET,
 };
-use crate::reserve::{parse_reserve, Reserve};
+use crate::reserve::{parse_reserve, Reserve, RESERVE_ACCOUNT_LEN};
 
 /// Kamino Lend mainnet program.
 pub const PROGRAM_ID: Pubkey = pubkey!("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
+/// Kamino's main lending market.
+pub const MAIN_MARKET: Pubkey = pubkey!("7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF");
 
 pub struct KaminoVenue {
     rpc: RpcClient,
@@ -217,6 +219,41 @@ pub fn find_obligations(rpc_url: &str, owner: &Pubkey) -> Result<Vec<(Pubkey, Ob
         )
         .context("getProgramAccounts on klend (needs an RPC that allows it, e.g. Helius)")?;
     accounts.into_iter().map(|(key, account)| Ok((key, parse_obligation(&account.data)?))).collect()
+}
+
+/// The reserve lending `mint` in `market`.
+pub fn find_reserve(rpc: &RpcClient, market: &Pubkey, mint: &Pubkey) -> Result<(Pubkey, Reserve)> {
+    // Account offsets: 8-byte discriminator, then the payload offsets in reserve.rs.
+    const MARKET_OFFSET: usize = 8 + 24;
+    const MINT_OFFSET: usize = 8 + 120;
+    // `config.status`: 0 active; markets keep hidden and obsolete reserves too.
+    const STATUS_OFFSET: usize = 8 + 4848;
+    let accounts = rpc
+        .get_program_accounts_with_config(
+            &PROGRAM_ID,
+            RpcProgramAccountsConfig {
+                filters: Some(vec![
+                    RpcFilterType::DataSize(RESERVE_ACCOUNT_LEN as u64),
+                    RpcFilterType::Memcmp(Memcmp::new_base58_encoded(
+                        MARKET_OFFSET,
+                        market.as_ref(),
+                    )),
+                    RpcFilterType::Memcmp(Memcmp::new_base58_encoded(MINT_OFFSET, mint.as_ref())),
+                    RpcFilterType::Memcmp(Memcmp::new_base58_encoded(STATUS_OFFSET, &[0])),
+                ]),
+                account_config: RpcAccountInfoConfig {
+                    encoding: Some(UiAccountEncoding::Base64),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .context("getProgramAccounts on klend (needs an RPC that allows it, e.g. Helius)")?;
+    match accounts.as_slice() {
+        [(key, account)] => Ok((*key, parse_reserve(&account.data)?)),
+        [] => bail!("market {market} has no active reserve for mint {mint}"),
+        _ => bail!("market {market} has {} active reserves for mint {mint}", accounts.len()),
+    }
 }
 
 #[cfg(test)]
