@@ -205,9 +205,31 @@ fn short(key: &Pubkey) -> String {
     format!("{}…{}", &s[..4], &s[s.len() - 4..])
 }
 
+/// A `[[position]]` entry that guards `address` at `target` leverage.
+pub fn entry(label: &str, address: &Pubkey, target: f64, lookup_table: Option<Pubkey>) -> String {
+    let table = lookup_table.map_or(String::new(), |t| format!("lookup_table = \"{t}\"\n"));
+    format!(
+        "[[position]]\nlabel = \"{label}\"\naddress = \"{address}\"\ntarget = {target:?}\n{table}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printed_entries_parse() {
+        let address: Pubkey = KAMINO.parse().unwrap();
+        let table: Pubkey = JUPITER.parse().unwrap();
+        let cfg = parse(&entry("SOL/USDC", &address, 1.5, Some(table))).unwrap();
+        let [p] = &cfg.positions[..] else { panic!("one position") };
+        assert_eq!((p.address, p.label.as_str()), (address, "SOL/USDC"));
+        assert_eq!((p.controller.target, p.lookup_table), (1.5, Some(table)));
+        assert_eq!(
+            parse(&entry("x", &address, 2.0, None)).unwrap().positions[0].controller.target,
+            2.0
+        );
+    }
 
     const KAMINO: &str = "2w9MS6MBFr68VpF6dkGwb2ucdKTpNFeXwmS79HSDTxAG";
     const JUPITER: &str = "9wG4DVpiJgbBu4chpRGZkKSoQQe9NcochTA3dAgs3eic";

@@ -971,12 +971,10 @@ fn run_open(args: OpenArgs) -> Result<()> {
             snap.debt_symbol,
             snap.liquidation_leverage()
         );
+        let label = format!("{}/{}", snap.collateral_symbol, snap.debt_symbol);
         println!(
-            "\nguard it: add to borrowguard.toml\n\n[[positions]]\nlabel = \"{}/{}\"\naddress = \"{}\"{}",
-            snap.collateral_symbol,
-            snap.debt_symbol,
-            opened.position,
-            opened.lookup_table.map_or(String::new(), |t| format!("\nlookup_table = \"{t}\""))
+            "\nguard it: add to borrowguard.toml\n\n{}",
+            config::entry(&label, &opened.position, args.leverage, opened.lookup_table)
         );
     }
     Ok(())
