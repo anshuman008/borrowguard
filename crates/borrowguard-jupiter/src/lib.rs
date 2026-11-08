@@ -32,6 +32,8 @@ use solana_program::{
 };
 use solana_sdk::{commitment_config::CommitmentConfig, message::Message, transaction::Transaction};
 
+use borrowguard_exec::token::associated_token_address;
+
 use crate::layout::{
     discriminator, parse_oracle, parse_position, parse_tick, parse_vault_config,
     token_account_owner, Oracle, Position, Tick, VaultConfig, POSITION_ACCOUNT_LEN,
@@ -210,6 +212,19 @@ impl JupiterVenue {
     /// The wallet holding the position's NFT, which controls the position.
     pub fn owner(&self) -> Result<Pubkey> {
         let pos = parse_position(&self.rpc.get_account_data(&self.position)?)?;
+        // Checking the expected holder (the payer) is one cheap read; finding
+        // an unknown holder is a lookup public RPCs throttle.
+        if let Some(payer) = self.payer.get() {
+            let ata = associated_token_address(payer, &pos.position_mint, &TOKEN_PROGRAMS[0]);
+            if let Ok(data) = self.rpc.get_account_data(&ata) {
+                if data.len() >= 72
+                    && token_account_owner(&data).ok() == Some(*payer)
+                    && data[64..72] == 1u64.to_le_bytes()
+                {
+                    return Ok(*payer);
+                }
+            }
+        }
         self.nft_holder(&pos.position_mint)
     }
 
