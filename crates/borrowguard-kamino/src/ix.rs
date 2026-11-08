@@ -5,7 +5,7 @@ use solana_program::{
     instruction::{AccountMeta, Instruction},
     pubkey,
     pubkey::Pubkey,
-    sysvar,
+    system_program, sysvar,
 };
 
 pub use borrowguard_exec::token::{
@@ -80,6 +80,102 @@ pub fn lending_market_authority(program_id: &Pubkey, lending_market: &Pubkey) ->
 pub fn obligation_farm_user_state(farm: &Pubkey, obligation: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"user", farm.as_ref(), obligation.as_ref()], &FARMS_PROGRAM_ID)
         .0
+}
+
+/// A wallet's klend user metadata, which every obligation of it points to.
+pub fn user_metadata(program_id: &Pubkey, owner: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"user_meta", owner.as_ref()], program_id).0
+}
+
+/// A plain ("vanilla", tag 0) obligation: the kind the Kamino UI's borrow
+/// tab opens. Its seeds are the default pubkey; `id` tells a wallet's apart.
+pub fn vanilla_obligation(program_id: &Pubkey, owner: &Pubkey, market: &Pubkey, id: u8) -> Pubkey {
+    let none = Pubkey::default();
+    Pubkey::find_program_address(
+        &[&[0], &[id], owner.as_ref(), market.as_ref(), none.as_ref(), none.as_ref()],
+        program_id,
+    )
+    .0
+}
+
+pub fn init_user_metadata(program_id: &Pubkey, owner: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*owner, true),
+            AccountMeta::new(*owner, true), // fee payer
+            AccountMeta::new(user_metadata(program_id, owner), false),
+            AccountMeta::new_readonly(*program_id, false), // no referrer
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        // No user lookup table.
+        data: [&discriminator("global", "init_user_metadata")[..], &[0; 32]].concat(),
+    }
+}
+
+pub fn init_vanilla_obligation(
+    program_id: &Pubkey,
+    owner: &Pubkey,
+    market: &Pubkey,
+    id: u8,
+) -> Instruction {
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*owner, true),
+            AccountMeta::new(*owner, true), // fee payer
+            AccountMeta::new(vanilla_obligation(program_id, owner, market, id), false),
+            AccountMeta::new_readonly(*market, false),
+            AccountMeta::new_readonly(Pubkey::default(), false),
+            AccountMeta::new_readonly(Pubkey::default(), false),
+            AccountMeta::new_readonly(user_metadata(program_id, owner), false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: [&discriminator("global", "init_obligation")[..], &[0, id]].concat(),
+    }
+}
+
+/// Which of a reserve's farms an obligation joins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FarmKind {
+    Collateral = 0,
+    Debt = 1,
+}
+
+/// Create the obligation's user state in `farm`, which v2 deposits / borrows
+/// on that reserve then keep up to date.
+pub fn init_obligation_farm(
+    program_id: &Pubkey,
+    owner: &Pubkey,
+    obligation: &Pubkey,
+    reserve_key: &Pubkey,
+    reserve: &Reserve,
+    farm: &Pubkey,
+    kind: FarmKind,
+) -> Instruction {
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*owner, true), // payer
+            AccountMeta::new_readonly(*owner, false),
+            AccountMeta::new(*obligation, false),
+            AccountMeta::new_readonly(
+                lending_market_authority(program_id, &reserve.lending_market),
+                false,
+            ),
+            AccountMeta::new(*reserve_key, false),
+            AccountMeta::new(*farm, false),
+            AccountMeta::new(obligation_farm_user_state(farm, obligation), false),
+            AccountMeta::new_readonly(reserve.lending_market, false),
+            AccountMeta::new_readonly(FARMS_PROGRAM_ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: [&discriminator("global", "init_obligation_farms_for_reserve")[..], &[kind as u8]]
+            .concat(),
+    }
 }
 
 fn with_amount(name: &str, amount: u64) -> Vec<u8> {
