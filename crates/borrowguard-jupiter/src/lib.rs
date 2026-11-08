@@ -11,6 +11,7 @@
 pub mod exec;
 pub mod ix;
 pub mod layout;
+pub mod open;
 pub mod tick;
 
 use std::sync::OnceLock;

@@ -8,6 +8,7 @@
 pub mod exec;
 pub mod ix;
 pub mod layout;
+pub mod open;
 pub mod reserve;
 
 use anyhow::{bail, ensure, Context, Result};

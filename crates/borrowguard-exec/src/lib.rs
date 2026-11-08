@@ -81,6 +81,17 @@ pub enum Executed {
     },
 }
 
+/// What opening a position did, step by step.
+pub struct Opened {
+    pub position: Pubkey,
+    /// The position's lookup table, if one was made: pass it to rebalances.
+    pub lookup_table: Option<Pubkey>,
+    pub steps: Vec<(&'static str, Executed)>,
+    /// Set when simulating stopped early because a later step needs an
+    /// earlier one on-chain.
+    pub stopped: Option<String>,
+}
+
 /// A venue that can rebalance a position it watches.
 pub trait Execute {
     /// Sell collateral worth `sell` (debt-token units) and repay debt with it,

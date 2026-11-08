@@ -10,7 +10,7 @@ use std::{path::PathBuf, time::Duration};
 use anyhow::{ensure, Context, Result};
 use borrowguard_core::Venue;
 use borrowguard_core::{leverage_from_ltv, Action, Params};
-use borrowguard_exec::{jupiter::Jupiter, load_keypair, ExecContext, Execute, Executed};
+use borrowguard_exec::{jupiter::Jupiter, load_keypair, ExecContext, Execute, Executed, Opened};
 use borrowguard_jupiter::JupiterVenue;
 use borrowguard_kamino::{KaminoVenue, Pubkey};
 use borrowguard_marginfi::MarginfiVenue;
@@ -54,10 +54,51 @@ enum Cmd {
     /// Create an address lookup table with a position's accounts (one-time,
     /// ~0.004 SOL rent). Rebalances need it to fit a swap route.
     LookupTable(LookupTableArgs),
+    /// Open a leveraged Kamino or Jupiter Lend position from the wallet in one
+    /// flash-loan transaction (plus one-time setup and a lookup table).
+    /// Simulates only unless --send is given.
+    Open(OpenArgs),
     /// Close a Kamino or Jupiter Lend position in one flash-loan transaction:
     /// repay all debt with part of the collateral, withdraw the rest to the
     /// wallet. Simulates only unless --send is given.
     Close(CloseArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OpenVenue {
+    Kamino,
+    Jupiter,
+}
+
+#[derive(Args)]
+struct OpenArgs {
+    #[arg(long, value_enum)]
+    venue: OpenVenue,
+    /// Kamino lending market.
+    #[arg(long, default_value_t = borrowguard_kamino::MAIN_MARKET)]
+    market: Pubkey,
+    /// Kamino collateral token: a symbol (SOL, JITOSOL, CBBTC, …) or a mint.
+    #[arg(long, required_if_eq("venue", "kamino"))]
+    collateral: Option<String>,
+    /// Kamino debt token: a symbol (USDC, SOL, …) or a mint.
+    #[arg(long, required_if_eq("venue", "kamino"))]
+    debt: Option<String>,
+    /// Jupiter Lend vault id; the vault fixes the pair.
+    #[arg(long, required_if_eq("venue", "jupiter"))]
+    vault: Option<u16>,
+    /// Collateral tokens to put in from the wallet.
+    #[arg(long)]
+    deposit: f64,
+    /// Leverage to open at, e.g. 2 for 2×.
+    #[arg(long)]
+    leverage: f64,
+    /// Owner's Solana keypair file (JSON), kept outside the repo.
+    #[arg(long, env = "BORROWGUARD_KEYPAIR")]
+    keypair: PathBuf,
+    #[command(flatten)]
+    rpc: RpcArgs,
+    #[command(flatten)]
+    exec: ExecArgs,
 }
 
 #[derive(Args)]
@@ -410,6 +451,7 @@ fn main() -> Result<()> {
         Cmd::Watch(args) => run_watch(args),
         Cmd::Rebalance(args) => run_rebalance(args),
         Cmd::LookupTable(args) => run_lookup_table(args),
+        Cmd::Open(args) => run_open(args),
         Cmd::Close(args) => run_close(args),
     }
 }
@@ -860,6 +902,83 @@ fn run_lookup_table(args: LookupTableArgs) -> Result<()> {
     let table =
         borrowguard_exec::tx::create_lookup_table(&rpc, &signer, &addresses, args.priority_fee)?;
     println!("lookup table: {table}\nuse it with: --lookup-table {table}");
+    Ok(())
+}
+
+/// A token given as a symbol (SOL, USDC, …) or a mint address.
+fn token_mint(token: &str) -> Result<Pubkey> {
+    if let Ok(mint) = token.parse() {
+        return Ok(mint);
+    }
+    borrowguard_core::token::mint(token)
+        .with_context(|| format!("unknown token {token}; pass its mint address"))?
+        .parse()
+        .map_err(Into::into)
+}
+
+fn run_open(args: OpenArgs) -> Result<()> {
+    let signer = load_keypair(&args.keypair)?;
+    let owner = solana_sdk::signer::Signer::pubkey(&signer);
+    let rpc_url = &args.rpc.rpc_url;
+    let send = args.exec.send;
+    println!(
+        "opening a {:?} position: deposit {}, leverage {}×{}",
+        args.venue,
+        args.deposit,
+        args.leverage,
+        if send { "" } else { " (simulation only; add --send to execute)" }
+    );
+    let ctx = args.exec.context(rpc_url, signer);
+    let opened: Opened = match args.venue {
+        OpenVenue::Kamino => borrowguard_kamino::open::open(
+            &ctx,
+            &borrowguard_kamino::open::OpenRequest {
+                market: args.market,
+                collateral_mint: token_mint(args.collateral.as_deref().unwrap_or_default())?,
+                debt_mint: token_mint(args.debt.as_deref().unwrap_or_default())?,
+                deposit: args.deposit,
+                leverage: args.leverage,
+            },
+        )?,
+        OpenVenue::Jupiter => borrowguard_jupiter::open::open(
+            &ctx,
+            rpc_url,
+            args.vault.context("--vault is required")?,
+            args.deposit,
+            args.leverage,
+        )?,
+    };
+    for (step, done) in &opened.steps {
+        print_executed(step, done);
+    }
+    if let Some(table) = opened.lookup_table {
+        println!("lookup table: {table}");
+    }
+    if let Some(why) = &opened.stopped {
+        println!("stopped: {why}");
+        return Ok(());
+    }
+    println!("position: {}", opened.position);
+    if send {
+        let venue = open_rebalancer(rpc_url, opened.position, owner)?;
+        let snap = venue.snapshot()?;
+        let lev = snap.position().leverage(snap.price()).unwrap_or(f64::INFINITY);
+        println!(
+            "{:.6} {} against {:.4} {}: {lev:.3}× (liquidation at {:.2}×)",
+            snap.collateral,
+            snap.collateral_symbol,
+            snap.debt,
+            snap.debt_symbol,
+            snap.liquidation_leverage()
+        );
+        println!(
+            "\nguard it: add to borrowguard.toml\n\n[[positions]]\nlabel = \"{}/{}\"\naddress = \"{}\"{}",
+            snap.collateral_symbol,
+            snap.debt_symbol,
+            opened.position,
+            opened.lookup_table.map_or(String::new(), |t| format!("\nlookup_table = \"{t}\""))
+        );
+    }
     Ok(())
 }
 
